@@ -8,3 +8,4 @@ google-genai
 pypdf
 pillow
 pandas
+fpdf
