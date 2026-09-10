@@ -106,7 +106,10 @@ def gerar_com_retry(client, model, contents, max_tentativas=3):
 
             except genai_errors.ClientError as e:
                 ultimo_erro = e
-                if e.status_code == 503:
+                # No SDK google-genai, ClientError expõe .code (int) e .status (str),
+                # não .status_code — daí o AttributeError anterior.
+                codigo_erro = getattr(e, "code", None)
+                if codigo_erro == 503:
                     tempo_espera = 2 ** tentativa  # 1s, 2s, 4s...
                     print(f"⚠️ Modelo {modelo_atual} indisponível (503). "
                           f"Tentativa {tentativa + 1}/{max_tentativas}. Aguardando {tempo_espera}s...")
