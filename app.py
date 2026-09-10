@@ -88,29 +88,44 @@ carregar_gabarito_salvo()
 def gerar_com_retry(client, model, contents, max_tentativas=3):
     """
     Tenta gerar conteúdo com retry automático e fallback de modelo.
+    Estratégia: para CADA modelo da lista de fallback, tenta até max_tentativas
+    vezes com backoff exponencial antes de passar para o próximo modelo.
     """
     modelos_fallback = [model, "gemini-2.0-flash", "gemini-1.5-flash"]
-    
-    for tentativa in range(max_tentativas):
-        for modelo_atual in modelos_fallback:
+
+    ultimo_erro = None
+
+    for modelo_atual in modelos_fallback:
+        for tentativa in range(max_tentativas):
             try:
                 resposta = client.models.generate_content(
                     model=modelo_atual,
                     contents=contents
                 )
                 return resposta  # Sucesso!
-                
+
             except genai_errors.ClientError as e:
+                ultimo_erro = e
                 if e.status_code == 503:
-                    # Erro de indisponibilidade — espera e tenta de novo
                     tempo_espera = 2 ** tentativa  # 1s, 2s, 4s...
-                    print(f"⚠️ Modelo {modelo_atual} indisponível (503). Aguardando {tempo_espera}s...")
+                    print(f"⚠️ Modelo {modelo_atual} indisponível (503). "
+                          f"Tentativa {tentativa + 1}/{max_tentativas}. Aguardando {tempo_espera}s...")
                     time.sleep(tempo_espera)
                 else:
-                    raise  # Outro erro, não é 503
-    
-    # Se todas as tentativas falharem
-    raise Exception("Servidor Gemini indisponível após várias tentativas. Tente novamente em alguns minutos.")
+                    raise  # Outro erro, não é 503 — não faz sentido insistir no mesmo modelo
+
+        print(f"➡️ Esgotadas as tentativas para {modelo_atual}. Passando para o próximo modelo de fallback...")
+
+    # Se todos os modelos e tentativas falharem
+    raise Exception(
+        "Servidor Gemini indisponível após várias tentativas em todos os modelos de fallback. "
+        "Tente novamente em alguns minutos."
+    ) from ultimo_erro
+
+
+NOME_MODELO_GEMINI = "gemini-2.5-flash"  # ajuste para o modelo padrão real do seu projeto
+
+
 st.set_page_config(
     page_title="Sistema de Avaliação Inteligente",
     page_icon="🎓",
@@ -127,9 +142,9 @@ st.markdown("### 📄 Passo 1: Enviar Material Didático e Configurar")
 st.write("Faça o upload dos seus materiais (PDFs ou Imagens) e selecione a disciplina para criar avaliações personalizadas.")
 
 lista_disciplinas = [
-    "Ciências", "Biologia", "Física", "Química", "Geografia", 
-    "História", "Sociologia", "Filosofia", "Inglês", "Espanhol", 
-    "Ed. Financeira", "Ed. Digital", "Ed. Ambiental", "Sustentabilidade", 
+    "Ciências", "Biologia", "Física", "Química", "Geografia",
+    "História", "Sociologia", "Filosofia", "Inglês", "Espanhol",
+    "Ed. Financeira", "Ed. Digital", "Ed. Ambiental", "Sustentabilidade",
     "Matemática", "Português", "Robótica", "Programação", "Ed. Física", "Artes"
 ]
 disciplina_escolhida = st.selectbox("Selecione o Componente Curricular:", lista_disciplinas)
@@ -148,11 +163,10 @@ with col_genero:
 if st.button("📄 Gerar Folha em PDF para Impressão"):
     with st.spinner("Desenhando a folha pautada..."):
         caminho_arquivo = criar_pdf_redacao(disciplina_escolhida, tema_redacao, genero_redacao)
-        
-        # Lê o PDF criado para liberar o download no navegador
+
         with open(caminho_arquivo, "rb") as f:
             pdf_bytes = f.read()
-            
+
         st.success("Folha gerada com sucesso! Clique abaixo para baixar e imprimir.")
         st.download_button(
             label="📥 Baixar Folha de Redação (PDF)",
@@ -162,10 +176,12 @@ if st.button("📄 Gerar Folha em PDF para Impressão"):
         )
 st.markdown("---")
 
-arquivos_upload = st.file_uploader(
-    "Escolha seus materiais (PDF, PNG, JPG)", 
-    type=["pdf", "png", "jpg", "jpeg"], 
-    accept_multiple_files=True
+# Uploader do material didático (Passo 1) — nome de variável exclusivo
+materiais_didaticos = st.file_uploader(
+    "Escolha seus materiais (PDF, PNG, JPG)",
+    type=["pdf", "png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+    key="uploader_materiais_didaticos"
 )
 
 # ---------------------------------------------------------------------------
@@ -175,7 +191,13 @@ st.markdown("---")
 st.markdown("### 👁️ Bloco 2: Laboratório de Letramento e Correção Multimodal")
 st.info("Tirou a foto da redação do aluno? Faça o upload aqui para o sistema transcrever, corrigir a gramática e avaliar a estrutura textual.")
 
-foto_redacao = st.file_uploader("Upload da Redação Escaneada (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"])
+# Uploader das fotos de redação (Bloco 2) — variável própria, usada pelo botão abaixo
+foto_redacao = st.file_uploader(
+    "Escolha a(s) foto(s) da redação manuscrita",
+    type=["pdf", "png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+    key="uploader_foto_redacao"
+)
 
 col_tema_corr, col_gen_corr = st.columns(2)
 with col_tema_corr:
@@ -184,78 +206,83 @@ with col_gen_corr:
     genero_alvo = st.selectbox("Gênero Textual cobrado:", ["Dissertação-Argumentativa", "Relatório Técnico", "Crônica", "Artigo de Opinião", "Texto Livre"])
 
 if st.button("🪄 Transcrever, Corrigir e Diagnosticar"):
-    if foto_redacao is not None:
+    if foto_redacao is not None and len(foto_redacao) > 0:
         with st.spinner("A IA está lendo a caligrafia, corrigindo a gramática e elaborando o diagnóstico..."):
             try:
                 from PIL import Image
-                # Prepara a imagem para a IA ler
-                imagem_aluno = Image.open(foto_redacao)
-                
-                # Instancia o modelo usando a sua função já existente
+
+                imagens_aluno = []
+                for foto in foto_redacao:
+                    imagens_aluno.append(Image.open(foto))
+
                 cliente_genai = configurar_gemini()
-                modelo = cliente_genai.GenerativeModel(NOME_MODELO_GEMINI)
-                
+
                 prompt_correcao = f"""
                 Atue como um professor avaliador rigoroso e empático de linguagens.
-                Leia o texto manuscrito na imagem anexa.
-                
+                Leia o texto manuscrito na(s) imagem(ns) anexa(s).
+
                 Tema proposto ao aluno: {tema_alvo}
                 Gênero Textual exigido: {genero_alvo}
-                
+
                 Devolva uma análise estruturada em Markdown contendo EXATAMENTE estes tópicos:
-                
+
                 ### 📝 1. Transcrição Fiel
                 (Transcreva o que o aluno escreveu. Se alguma palavra estiver totalmente ilegível, coloque [ilegível]).
-                
+
                 ### 🚨 2. Análise Gramatical (Norma-Padrão)
                 (Aponte com clareza os desvios de ortografia, concordância, regência ou pontuação).
-                
+
                 ### 🏗️ 3. Análise de Estrutura Textual e Tema
                 (Avalie se o texto respeita a estrutura do gênero '{genero_alvo}' e se abordou adequadamente o tema proposto).
-                
+
                 ### 📊 4. Nota Sugerida
                 (Atribua uma nota justa de 0 a 10 baseada nos critérios acima, explicando rapidamente o peso).
-                
+
                 ### 🧠 5. Diagnóstico DUA e Intervenção
-                (Forneça um diagnóstico pedagógico estruturado no Desenho Universal para a Aprendizagem[cite: 1, 3]. Sugira 1 ou 2 intervenções práticas para ajudar este aluno específico a superar as barreiras de escrita identificadas).
+                (Forneça um diagnóstico pedagógico estruturado no Desenho Universal para a Aprendizagem. Sugira 1 ou 2 intervenções práticas para ajudar este aluno específico a superar as barreiras de escrita identificadas).
                 """
-                
-                # Envia a foto E o texto de comando juntos para a IA!
-                resposta = modelo.generate_content([prompt_correcao, imagem_aluno])
-                
+
+                pacote_para_ia = [prompt_correcao] + imagens_aluno
+
+                # Agora usa a função de retry/fallback em vez de chamar a API diretamente
+                resposta = gerar_com_retry(
+                    client=cliente_genai,
+                    model=NOME_MODELO_GEMINI,
+                    contents=pacote_para_ia
+                )
+
                 st.success("Análise concluída com sucesso!")
                 st.markdown(resposta.text)
-                
+
             except Exception as e:
                 st.error(f"Erro durante a leitura multimodal: {str(e)}")
     else:
-        st.warning("⚠️ Por favor, faça o upload da foto da redação antes de clicar em analisar.")
+        st.warning("⚠️ Por favor, faça o upload da(s) foto(s) da redação antes de clicar em analisar.")
 
+# ---------------------------------------------------------------------------
+# Extração de texto do material didático (Passo 1)
+# ---------------------------------------------------------------------------
 conteudo_para_ia = []
 texto_extraido_total = ""
 
-if arquivos_upload:
+if materiais_didaticos:
     try:
-        for arquivo in arquivos_upload:
+        for arquivo in materiais_didaticos:
             if arquivo.type == "application/pdf":
                 leitor_pdf = PdfReader(arquivo)
                 for pagina in leitor_pdf.pages:
-                    texto_pagina = pagina.extract_text()
-                    if texto_pagina:
-                        texto_extraido_total += texto_pagina + "\n"
-                st.success(f"✅ Arquivo PDF '{arquivo.name}' lido com sucesso!")
+                    texto_pagina = pagina.extract_text() or ""
+                    texto_extraido_total += texto_pagina + "\n"
             else:
-                imagem = Image.open(arquivo)
-                conteudo_para_ia.append(imagem)
-                st.success(f"✅ Imagem '{arquivo.name}' carregada com sucesso!")
-                st.image(imagem, caption=f"Lido: {arquivo.name}", use_container_width=True)
+                # Imagem (PNG/JPG) — trata como conteúdo multimodal para a IA
+                from PIL import Image
+                conteudo_para_ia.append(Image.open(arquivo))
 
         if texto_extraido_total:
             conteudo_para_ia.append(texto_extraido_total)
-            with st.expander("🔍 Clique para ver uma prévia de todo o texto extraído"):
-                st.text(texto_extraido_total[:1500] + ("..." if len(texto_extraido_total) > 1500 else ""))
+
     except Exception as e:
-        st.error(f"Erro durante o processamento dos arquivos: {str(e)}")
+        st.error(f"Erro ao processar os materiais didáticos: {str(e)}")
 
 st.markdown("### 🧠 Passo 2: Gerar Avaliação e Formulário")
 
