@@ -52,6 +52,12 @@ def gerar_com_retry(client, model, contents, max_tentativas=3):
                     print(f"⚠️ Modelo {modelo_atual} indisponível (503). "
                           f"Tentativa {tentativa + 1}/{max_tentativas}. Aguardando {tempo_espera}s...")
                     time.sleep(tempo_espera)
+                elif codigo_erro == 429:
+                    # Cota (diária ou por minuto) esgotada para este modelo especificamente.
+                    # Insistir no mesmo modelo não adianta — cada modelo tem cota própria,
+                    # então pula direto para o próximo da lista de fallback.
+                    print(f"⚠️ Cota esgotada para {modelo_atual} (429). Pulando para o próximo modelo...")
+                    break
                 else:
                     raise  # Erro diferente de 503 — não insiste no mesmo modelo
         print(f"➡️ Esgotadas as tentativas para {modelo_atual}. Tentando o próximo modelo de fallback...")
