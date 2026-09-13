@@ -3,42 +3,15 @@ import os
 import re
 import time
 from google import genai
-import streamlit as st
-import time
 from google.genai import errors as genai_errors
+import streamlit as st
 
-def gerar_com_retry(client, model, contents, max_tentativas=3):
-    """
-    Tenta gerar conteúdo com retry automático e fallback de modelo.
-    """
-    modelos_fallback = [model, "gemini-2.0-flash", "gemini-1.5-flash"]
-    
-    for tentativa in range(max_tentativas):
-        for modelo_atual in modelos_fallback:
-            try:
-                resposta = client.models.generate_content(
-                    model=modelo_atual,
-                    contents=contents
-                )
-                return resposta  # Sucesso!
-                
-            except genai_errors.ClientError as e:
-                if e.status_code == 503:
-                    # Erro de indisponibilidade — espera e tenta de novo
-                    tempo_espera = 2 ** tentativa  # 1s, 2s, 4s...
-                    print(f"⚠️ Modelo {modelo_atual} indisponível (503). Aguardando {tempo_espera}s...")
-                    time.sleep(tempo_espera)
-                else:
-                    raise  # Outro erro, não é 503
-    
-    # Se todas as tentativas falharem
-    raise Exception("Servidor Gemini indisponível após várias tentativas. Tente novamente em alguns minutos.")
 NOME_MODELO_GEMINI = "gemini-2.5-flash"
 
 
 def configurar_gemini():
     """
-    Configura e retorna o cliente da NOVA API do Gemini (google-genai).
+    Configura e retorna o cliente da API do Gemini (google-genai).
     """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -50,26 +23,64 @@ def configurar_gemini():
     if not api_key:
         raise ValueError("GEMINI_API_KEY não encontrada. Configure a variável de ambiente ou st.secrets.")
 
-    client = genai.Client(api_key=api_key)
-    return client
+    return genai.Client(api_key=api_key)
+
+
+def gerar_com_retry(client, model, contents, max_tentativas=3):
+    """
+    Gera conteúdo com retry automático (backoff exponencial) e fallback de modelo.
+    Estratégia: para CADA modelo da lista de fallback, tenta até max_tentativas
+    vezes antes de passar para o próximo modelo.
+
+    Única função de retry do projeto — usada tanto na geração de provas
+    quanto na correção multimodal e no processamento de notas.
+    """
+    modelos_fallback = list(dict.fromkeys([model, "gemini-2.0-flash", "gemini-1.5-flash"]))
+    ultimo_erro = None
+
+    for modelo_atual in modelos_fallback:
+        for tentativa in range(max_tentativas):
+            try:
+                return client.models.generate_content(model=modelo_atual, contents=contents)
+            except genai_errors.ClientError as e:
+                ultimo_erro = e
+                # No SDK google-genai, ClientError expõe .code (int) e .status (str),
+                # não .status_code.
+                codigo_erro = getattr(e, "code", None)
+                if codigo_erro == 503:
+                    tempo_espera = 2 ** tentativa  # 1s, 2s, 4s...
+                    print(f"⚠️ Modelo {modelo_atual} indisponível (503). "
+                          f"Tentativa {tentativa + 1}/{max_tentativas}. Aguardando {tempo_espera}s...")
+                    time.sleep(tempo_espera)
+                else:
+                    raise  # Erro diferente de 503 — não insiste no mesmo modelo
+        print(f"➡️ Esgotadas as tentativas para {modelo_atual}. Tentando o próximo modelo de fallback...")
+
+    raise Exception(
+        "Servidor Gemini indisponível após várias tentativas em todos os modelos de fallback. "
+        "Tente novamente em alguns minutos."
+    ) from ultimo_erro
 
 
 def extrair_json(texto_bruto):
     """
     Extrai JSON de dentro do texto retornado pela IA.
-    Aceita blocos markdown (```json ... ```) ou JSON puro.
+    Aceita blocos markdown (```json ... ```) ou JSON puro, e remove
+    quebras de linha/tabs que costumam invalidar o parsing.
     """
-    padrao_md = re.search(r'`\`\`(?:json)?\s*([\s\S]*?)\s*\`\`\`', texto_bruto)
+    padrao_md = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", texto_bruto)
     if padrao_md:
-        return padrao_md.group(1).strip()
+        bruto = padrao_md.group(1).strip()
+    else:
+        indices_abre = [i for i in (texto_bruto.find('{'), texto_bruto.find('[')) if i != -1]
+        indices_fecha = [i for i in (texto_bruto.rfind('}'), texto_bruto.rfind(']')) if i != -1]
 
-    idx_abre = min(i for i in [texto_bruto.find('{'), texto_bruto.find('[')] if i != -1)
-    idx_fecha = max(i for i in [texto_bruto.rfind('}'), texto_bruto.rfind(']')] if i != -1)
+        if not indices_abre or not indices_fecha or max(indices_fecha) < min(indices_abre):
+            raise ValueError("Nenhum JSON válido encontrado na resposta da IA.")
 
-    if idx_abre == -1 or idx_fecha == -1 or idx_fecha < idx_abre:
-        raise ValueError("Nenhum JSON válido encontrado na resposta da IA.")
+        bruto = texto_bruto[min(indices_abre):max(indices_fecha) + 1]
 
-    return texto_bruto[idx_abre:idx_fecha + 1]
+    return bruto.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').replace('\\n', ' ').strip()
 
 
 def calcular_conceito(nota, maximo):
@@ -82,9 +93,9 @@ def calcular_conceito(nota, maximo):
     """
     if maximo == 0:
         return "Indefinido"
-    
+
     nota_final = float(nota)
-    
+
     if nota_final <= 4.0:
         return "Baixo"
     elif nota_final <= 5.9:
@@ -116,7 +127,7 @@ def processar_avaliacoes_personalizadas(folha, gabarito, tipo_gabarito="diagnost
         "Nota Discursivas (0-4)",
         "Nota Final (0-10)",
         "Diagnóstico DUA",
-        "Conceito"
+        "Conceito",
     ]
     for col in colunas_novas:
         if col not in cabecalho:
@@ -171,16 +182,6 @@ def processar_avaliacoes_personalizadas(folha, gabarito, tipo_gabarito="diagnost
             if resp.startswith(correta) or resp == correta:
                 acertos_obj += 1
 
-        prompt_discursivas = []
-        for j, q_disc in enumerate(questoes_discursivas):
-            idx_resposta = len(questoes_objetivas) + j
-            resp_texto = respostas_aluno[idx_resposta] if idx_resposta < len(respostas_aluno) else ""
-            prompt_discursivas.append(
-                f"Questão {len(questoes_objetivas) + j + 1}: {q_disc.get('pergunta', '')}\n"
-                f"Critério de Correção: {q_disc.get('criterio_correcao', '')}\n"
-                f"Resposta do Aluno: {resp_texto}\n"
-            )
-
         if not questoes_discursivas:
             nota_final = float(acertos_obj)
             maximo_possivel = len(questoes_objetivas)
@@ -192,6 +193,16 @@ def processar_avaliacoes_personalizadas(folha, gabarito, tipo_gabarito="diagnost
             folha.update_cell(i, idx_diag + 1, "Sem questões discursivas.")
             folha.update_cell(i, idx_conceito + 1, conceito)
             continue
+
+        prompt_discursivas = []
+        for j, q_disc in enumerate(questoes_discursivas):
+            idx_resposta = len(questoes_objetivas) + j
+            resp_texto = respostas_aluno[idx_resposta] if idx_resposta < len(respostas_aluno) else ""
+            prompt_discursivas.append(
+                f"Questão {len(questoes_objetivas) + j + 1}: {q_disc.get('pergunta', '')}\n"
+                f"Critério de Correção: {q_disc.get('criterio_correcao', '')}\n"
+                f"Resposta do Aluno: {resp_texto}\n"
+            )
 
         bloco_discursivas = "\n".join(prompt_discursivas)
         notas_placeholder = ", ".join(["0.0"] * len(questoes_discursivas))
@@ -210,7 +221,7 @@ AVALIAÇÃO DAS DISCURSIVAS (Nota Máxima: 2,0 valores cada):
 TAREFA OBRIGATÓRIA:
 1. Analise cada resposta discursiva com base nos critérios e atribua notas fracionadas de 0.0 a 2.0.
 2. Calcule a Nota Final (Acertos Objetivos + Soma das Discursivas). O máximo possível é {maximo_teorico}.
-3. Elabore um Diagnóstico Pedagógico DUA de 1 parágrafo focado nas lacunas conceptuais demonstradas, sugerindo estratégias práticas de recomposição.
+3. Elabore um Diagnóstico Pedagógico DUA de 1 parágrafo focado nas lacunas conceituais demonstradas, sugerindo estratégias práticas de recomposição.
 
 REGRA DE RETORNO (BLINDADA):
 Devolva APENAS um JSON EXATO e estritamente válido.
@@ -226,13 +237,10 @@ Formato esperado:
 """
 
         try:
-            resposta_ia = client.models.generate_content(
-                model=NOME_MODELO_GEMINI,
-                contents=prompt_avaliacao
-            )
+            resposta_ia = gerar_com_retry(client, NOME_MODELO_GEMINI, prompt_avaliacao)
 
             texto_limpo = extrair_json(resposta_ia.text)
-            resultado_json = json.loads(texto_limpo)
+            resultado_json = json.loads(texto_limpo, strict=False)
 
             notas_disc = resultado_json.get("notas_disc", [0.0] * len(questoes_discursivas))
             if not isinstance(notas_disc, list):

@@ -7,10 +7,11 @@ from googleapiclient.discovery import build
 
 SCOPES = [
     "https://www.googleapis.com/auth/forms.body",
-    "https://www.googleapis.com/auth/drive"
+    "https://www.googleapis.com/auth/drive",
 ]
 
-ID_DA_PASTA = "1d5S_NOKGI0mxJHkwnxgZfoR27EZxCS4e"
+ID_DA_PASTA = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1d5S_NOKGI0mxJHkwnxgZfoR27EZxCS4e")
+
 
 def _validar_json_caminho(caminho, nome_amigavel):
     """Verifica se o arquivo JSON existe, não está vazio e é válido."""
@@ -38,6 +39,7 @@ def _validar_json_caminho(caminho, nome_amigavel):
         )
 
     return dados
+
 
 def autenticar_usuario():
     creds = None
@@ -78,7 +80,6 @@ def autenticar_usuario():
             "4. Baixe o JSON, renomeie para 'cliente_oauth.json' e cole na pasta."
         )
 
-    # Valida o JSON antes de usar
     _validar_json_caminho('cliente_oauth.json', 'OAuth Client ID')
 
     flow = InstalledAppFlow.from_client_secrets_file('cliente_oauth.json', SCOPES)
@@ -89,29 +90,16 @@ def autenticar_usuario():
 
     return creds
 
-def criar_formulario_ia(questoes_json, disciplina):
-    creds = autenticar_usuario()
-    forms_service = build('forms', 'v1', credentials=creds)
-    drive_service = build('drive', 'v3', credentials=creds)
 
-    questoes = json.loads(questoes_json) if isinstance(questoes_json, str) else questoes_json
-
-    form_body = {
-        "info": {
-            "title": f"Avaliação Inteligente - {disciplina}",
-            "documentTitle": f"Avaliação - {disciplina}"
-        }
-    }
-    form_criado = forms_service.forms().create(body=form_body).execute()
-    form_id = form_criado["formId"]
-
+def _montar_requests_forms(questoes):
+    """Monta a lista de requests do batchUpdate: cabeçalho fixo + questões."""
     requests = []
     cabecalho = [
         "1. Nome Completo:",
         "2. Turma:",
         "3. Escola:",
         "4. Nível de Ensino:",
-        "5. Componente Curricular:"
+        "5. Componente Curricular:",
     ]
 
     for i, pergunta in enumerate(cabecalho):
@@ -131,8 +119,8 @@ def criar_formulario_ia(questoes_json, disciplina):
         })
 
     for i, q in enumerate(questoes):
-        index_atual = i + 5
-        titulo = f"Questão {i+1}: {q.get('pergunta', '')}"
+        index_atual = i + len(cabecalho)
+        titulo = f"Questão {i + 1}: {q.get('pergunta', '')}"
 
         if q.get("tipo") == "discursiva":
             item = {
@@ -150,12 +138,11 @@ def criar_formulario_ia(questoes_json, disciplina):
                 }
             }
         else:
-            opcoes = []
-            for letra in ["A", "B", "C", "D", "E"]:
-                texto = q.get(letra, "")
-                if texto:
-                    opcoes.append({"value": f"{letra}) {texto}"})
-
+            opcoes = [
+                {"value": f"{letra}) {q[letra]}"}
+                for letra in ["A", "B", "C", "D", "E"]
+                if q.get(letra)
+            ]
             item = {
                 "createItem": {
                     "item": {
@@ -175,6 +162,26 @@ def criar_formulario_ia(questoes_json, disciplina):
             }
         requests.append(item)
 
+    return requests
+
+
+def criar_formulario_ia(questoes_json, disciplina):
+    creds = autenticar_usuario()
+    forms_service = build('forms', 'v1', credentials=creds)
+    drive_service = build('drive', 'v3', credentials=creds)
+
+    questoes = json.loads(questoes_json) if isinstance(questoes_json, str) else questoes_json
+
+    form_body = {
+        "info": {
+            "title": f"Avaliação Inteligente - {disciplina}",
+            "documentTitle": f"Avaliação - {disciplina}"
+        }
+    }
+    form_criado = forms_service.forms().create(body=form_body).execute()
+    form_id = form_criado["formId"]
+
+    requests = _montar_requests_forms(questoes)
     forms_service.forms().batchUpdate(formId=form_id, body={"requests": requests}).execute()
 
     try:
@@ -186,7 +193,7 @@ def criar_formulario_ia(questoes_json, disciplina):
             removeParents=previous_parents,
             fields='id, parents'
         ).execute()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Não foi possível mover o formulário para a pasta do Drive: {e}")
 
     return f"https://docs.google.com/forms/d/{form_id}/edit"
