@@ -361,8 +361,16 @@ ESCOPO_SHEETS = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
 def conectar_sheets(id_planilha):
-    caminho_credenciais = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credenciais.json")
-    credenciais = ServiceAccountCredentials.from_service_account_file(caminho_credenciais, scopes=ESCOPO_SHEETS)
+    # No Streamlit Community Cloud não existe arquivo local de credenciais —
+    # nesse caso, o service account é lido dos Secrets do app
+    # (bloco [gcp_service_account] em Settings > Secrets).
+    if "gcp_service_account" in st.secrets:
+        info = dict(st.secrets["gcp_service_account"])
+        credenciais = ServiceAccountCredentials.from_service_account_info(info, scopes=ESCOPO_SHEETS)
+    else:
+        caminho_credenciais = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credenciais.json")
+        credenciais = ServiceAccountCredentials.from_service_account_file(caminho_credenciais, scopes=ESCOPO_SHEETS)
+
     cliente = gspread.authorize(credenciais)
     return cliente.open_by_key(id_planilha).sheet1
 
