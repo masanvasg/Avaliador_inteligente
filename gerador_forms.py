@@ -12,6 +12,13 @@ SCOPES = [
 
 ID_DA_PASTA = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1d5S_NOKGI0mxJHkwnxgZfoR27EZxCS4e")
 
+# Pasta onde este arquivo está fisicamente salvo. Usar isso em vez de caminhos
+# relativos evita bugs de "arquivo não encontrado" quando o app é iniciado
+# a partir de um diretório de trabalho diferente do projeto.
+PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
+CAMINHO_CLIENTE_OAUTH = os.path.join(PASTA_BASE, 'cliente_oauth.json')
+CAMINHO_TOKEN = os.path.join(PASTA_BASE, 'token.json')
+
 
 def _validar_json_caminho(caminho, nome_amigavel):
     """Verifica se o arquivo JSON existe, não está vazio e é válido."""
@@ -59,9 +66,9 @@ def autenticar_usuario():
         pass
 
     # 2. Tenta token.json (local, gerado após primeira autorização)
-    if os.path.exists('token.json'):
+    if os.path.exists(CAMINHO_TOKEN):
         try:
-            creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+            creds = Credentials.from_authorized_user_file(CAMINHO_TOKEN, SCOPES)
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())
                 return creds
@@ -71,21 +78,21 @@ def autenticar_usuario():
             pass  # token.json pode estar corrompido, segue para recriar
 
     # 3. Fluxo local — precisa do cliente_oauth.json
-    if not os.path.exists('cliente_oauth.json'):
+    if not os.path.exists(CAMINHO_CLIENTE_OAUTH):
         raise FileNotFoundError(
-            "Arquivo 'cliente_oauth.json' não encontrado.\n"
+            f"Arquivo 'cliente_oauth.json' não encontrado em '{PASTA_BASE}'.\n"
             "1. Vá em https://console.cloud.google.com/apis/credentials\n"
             "2. Clique em '+ CREATE CREDENTIALS' → 'OAuth client ID'\n"
             "3. Tipo: Desktop app | Nome: Avaliador Forms\n"
-            "4. Baixe o JSON, renomeie para 'cliente_oauth.json' e cole na pasta."
+            "4. Baixe o JSON, renomeie para 'cliente_oauth.json' e cole na pasta do projeto."
         )
 
-    _validar_json_caminho('cliente_oauth.json', 'OAuth Client ID')
+    _validar_json_caminho(CAMINHO_CLIENTE_OAUTH, 'OAuth Client ID')
 
-    flow = InstalledAppFlow.from_client_secrets_file('cliente_oauth.json', SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(CAMINHO_CLIENTE_OAUTH, SCOPES)
     creds = flow.run_local_server(port=0)
 
-    with open('token.json', 'w') as token:
+    with open(CAMINHO_TOKEN, 'w') as token:
         token.write(creds.to_json())
 
     return creds
