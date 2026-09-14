@@ -204,3 +204,44 @@ def criar_formulario_ia(questoes_json, disciplina):
         print(f"⚠️ Não foi possível mover o formulário para a pasta do Drive: {e}")
 
     return f"https://docs.google.com/forms/d/{form_id}/edit"
+
+def criar_relatorio_google_docs(nome_aluno, texto_diagnostico, id_pasta_destino):
+    """
+    Cria um documento no Google Docs com o diagnóstico do aluno e 
+    salva diretamente na pasta do Drive do professor.
+    """
+    # 1. Autentica usando a função que você já tem no arquivo
+    creds = autenticar_usuario()
+    
+    # Conecta com a API do Drive e do Docs
+    from googleapiclient.discovery import build
+    drive_service = build('drive', 'v3', credentials=creds)
+    docs_service = build('docs', 'v1', credentials=creds)
+    
+    # 2. Cria o documento vazio dentro da pasta escolhida
+    metadata_arquivo = {
+        'name': f'Diagnóstico DUA - {nome_aluno}',
+        'mimeType': 'application/vnd.google-apps.document',
+        'parents': [id_pasta_destino]
+    }
+    
+    arquivo = drive_service.files().create(body=metadata_arquivo, fields='id').execute()
+    id_documento = arquivo.get('id')
+    
+    # 3. Insere o texto gerado pela Inteligência Artificial dentro do documento
+    comandos_edicao = [
+        {
+            'insertText': {
+                'location': {'index': 1},
+                'text': texto_diagnostico
+            }
+        }
+    ]
+    
+    docs_service.documents().batchUpdate(
+        documentId=id_documento, 
+        body={'requests': comandos_edicao}
+    ).execute()
+    
+    # Retorna o link para o professor poder abrir o Doc na hora
+    return f"https://docs.google.com/document/d/{id_documento}/edit"

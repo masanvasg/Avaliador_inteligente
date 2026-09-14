@@ -10,6 +10,7 @@ from fpdf import FPDF
 from PIL import Image
 from pypdf import PdfReader
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+from gerador_forms import criar_formulario_ia, criar_relatorio_google_docs
 
 from avaliador import (
     NOME_MODELO_GEMINI,
@@ -182,38 +183,74 @@ if st.button("🪄 Transcrever, Corrigir e Diagnosticar"):
                 prompt_correcao = f"""
                 Atue como um professor avaliador rigoroso e empático de linguagens.
                 Leia o texto manuscrito na(s) imagem(ns) anexa(s).
-
+                
+                Sua primeira tarefa é identificar o nome do aluno que está preenchido à mão no cabeçalho da folha (no campo "Nome:").
+                
                 Tema proposto ao aluno: {tema_alvo}
                 Gênero Textual exigido: {genero_alvo}
-
+                
                 Devolva uma análise estruturada em Markdown contendo EXATAMENTE estes tópicos:
-
+                
                 ### 📝 1. Transcrição Fiel
                 (Transcreva o que o aluno escreveu. Se alguma palavra estiver totalmente ilegível, coloque [ilegível]).
-
+                
                 ### 🚨 2. Análise Gramatical (Norma-Padrão)
                 (Aponte com clareza os desvios de ortografia, concordância, regência ou pontuação).
-
+                
                 ### 🏗️ 3. Análise de Estrutura Textual e Tema
                 (Avalie se o texto respeita a estrutura do gênero '{genero_alvo}' e se abordou adequadamente o tema proposto).
-
+                
                 ### 📊 4. Nota Sugerida
                 (Atribua uma nota justa de 0 a 10 baseada nos critérios acima, explicando rapidamente o peso).
-
-                ### 🧠 5. Diagnóstico DUA e Intervenção
-                (Forneça um diagnóstico pedagógico estruturado no Desenho Universal para a Aprendizagem. Sugira 1 ou 2 intervenções práticas para ajudar este aluno específico a superar as barreiras de escrita identificadas).
+                
+                ### 🧠 5. Diagnóstico DUA de [INSERIR AQUI O NOME LIDO NO CABEÇALHO]
+                (Inicie o texto chamando o aluno pelo nome, por exemplo: "Olá, [Nome], ...". Forneça um diagnóstico pedagógico estruturado no Desenho Universal para a Aprendizagem. Sugira 1 ou 2 intervenções práticas para ajudar este aluno específico a superar as barreiras de escrita identificadas).
                 """
 
+                # ... [O restante do seu código que chama a IA fica aqui em cima] ...
                 pacote_para_ia = [prompt_correcao] + imagens_aluno
                 resposta = gerar_com_retry(cliente_genai, NOME_MODELO_GEMINI, pacote_para_ia)
-
+                
+                # 1. Salva o texto na memória para o botão de salvar não desaparecer!
+                st.session_state["diagnostico_atual"] = resposta.text
                 st.success("Análise concluída com sucesso!")
-                st.markdown(resposta.text)
-
+                
             except Exception as e:
                 st.error(f"Erro durante a leitura multimodal: {str(e)}")
     else:
         st.warning("⚠️ Por favor, faça o upload da(s) foto(s) da redação antes de clicar em analisar.")
+
+# 2. ESTE BLOCO FICA TOTALMENTE FORA DO BOTÃO DE "TRANSCREVER"
+if "diagnostico_atual" in st.session_state:
+    # Exibe o texto da IA na tela
+    st.markdown(st.session_state["diagnostico_atual"])
+    
+    st.markdown("---")
+    st.write("#### 💾 Salvar Avaliação no Google Drive")
+    
+    # Substitua pelo ID real da pasta que você copiou no Passo 1
+    ID_PASTA_REDACAO = "18uvref4E9loqwTkxy-tIWR31jsLjan0b" 
+    
+    if st.button("📄 Salvar Relatório (Google Docs)"):
+        with st.spinner("Criando documento no Google Drive..."):
+            try:
+                # Dica: Futuramente podemos puxar o nome que a IA leu do cabeçalho
+                nome_aluno_formatado = "Aluno da Redação" 
+                
+                link_doc = criar_relatorio_google_docs(
+                    nome_aluno=nome_aluno_formatado,
+                    texto_diagnostico=st.session_state["diagnostico_atual"],
+                    id_pasta_destino=ID_PASTA_REDACAO
+                )
+                
+                st.success("✅ Relatório salvo com sucesso na sua pasta do Drive!")
+                st.markdown(f"[🔗 **CLIQUE AQUI PARA ABRIR O GOOGLE DOCS**]({link_doc})")
+                
+            except Exception as e:
+                st.error(f"Ocorreu um erro ao salvar: {str(e)}")
+
+else:
+    st.warning("⚠️ Por favor, faça o upload da(s) foto(s) da redação antes de clicar em analisar.")
 
 # ---------------------------------------------------------------------------
 # Extração de texto/imagens do material didático (Passo 1)
