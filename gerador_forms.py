@@ -1,247 +1,321 @@
-import os
+"""
+Integração com Google Forms, Drive e Docs.
+
+  - autenticação OAuth (local ou via Secrets no Streamlit Cloud);
+  - criação do formulário com cabeçalho de identificação + questões;
+  - movimentação do arquivo para a pasta da turma;
+  - geração do relatório de diagnóstico em Google Docs.
+"""
+
+from __future__ import annotations
+
 import json
+import os
+import re
+from typing import Any
+
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+
+from config import CAMINHO_CLIENTE_OAUTH, CAMINHO_TOKEN, PASTA_BASE, logger
 
 SCOPES = [
     "https://www.googleapis.com/auth/forms.body",
     "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
 ]
 
-ID_DA_PASTA = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1d5S_NOKGI0mxJHkwnxgZfoR27EZxCS4e")
+CAMPOS_IDENTIFICACAO = [
+    "1. Nome Completo:",
+    "2. Turma:",
+    "3. Escola:",
+    "4. Nível de Ensino:",
+    "5. Componente Curricular:",
+]
 
-# Pasta onde este arquivo está fisicamente salvo. Usar isso em vez de caminhos
-# relativos evita bugs de "arquivo não encontrado" quando o app é iniciado
-# a partir de um diretório de trabalho diferente do projeto.
-PASTA_BASE = os.path.dirname(os.path.abspath(__file__))
-CAMINHO_CLIENTE_OAUTH = os.path.join(PASTA_BASE, 'cliente_oauth.json')
-CAMINHO_TOKEN = os.path.join(PASTA_BASE, 'token.json')
+LETRAS_ALTERNATIVAS = ["A", "B", "C", "D", "E"]
 
 
-def _validar_json_caminho(caminho, nome_amigavel):
-    """Verifica se o arquivo JSON existe, não está vazio e é válido."""
+# ---------------------------------------------------------------------------
+# Utilitários de link
+# ---------------------------------------------------------------------------
+def extrair_id_pasta(texto: str) -> str:
+    """Aceita o link completo da pasta do Drive ou o ID cru."""
+    if not texto:
+        return ""
+    texto = texto.strip()
+    m = re.search(r"/folders/([A-Za-z0-9_-]+)", texto)
+    return m.group(1) if m else texto
+
+
+def extrair_id_planilha(texto: str) -> str:
+    """Aceita o link completo da planilha ou o ID cru."""
+    if not texto:
+        return ""
+    texto = texto.strip()
+    m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", texto)
+    return m.group(1) if m else texto
+
+
+# ---------------------------------------------------------------------------
+# Autenticação
+# ---------------------------------------------------------------------------
+def _validar_json_caminho(caminho: str, nome_amigavel: str) -> dict:
+    """Confere se o arquivo de credenciais existe, tem conteúdo e é JSON válido."""
     if not os.path.exists(caminho):
         raise FileNotFoundError(
-            f"Arquivo '{caminho}' não encontrado. "
-            f"Coloque o {nome_amigavel} baixado do Google Cloud na pasta do projeto."
+            f"Arquivo '{caminho}' não encontrado. Coloque o {nome_amigavel} "
+            "baixado do Google Cloud na pasta do projeto."
         )
 
-    with open(caminho, 'r', encoding='utf-8') as f:
+    with open(caminho, "r", encoding="utf-8") as f:
         conteudo = f.read().strip()
 
     if not conteudo:
         raise ValueError(
-            f"O arquivo '{caminho}' está VAZIO (0 bytes). "
-            f"Baixe o {nome_amigavel} correto do Google Cloud Console e substitua."
+            f"O arquivo '{caminho}' está vazio. Baixe novamente o {nome_amigavel} "
+            "no Google Cloud Console e substitua."
         )
 
     try:
-        dados = json.loads(conteudo)
+        return json.loads(conteudo)
     except json.JSONDecodeError as e:
         raise ValueError(
-            f"O arquivo '{caminho}' não é um JSON válido. "
-            f"Erro: {e}. Verifique se copiou o conteúdo completo."
-        )
-
-    return dados
+            f"O arquivo '{caminho}' não é um JSON válido ({e}). "
+            "Verifique se o conteúdo foi copiado por inteiro."
+        ) from e
 
 
-def autenticar_usuario():
-    creds = None
-
-    # 1. Tenta Streamlit secrets (Cloud)
+def _credenciais_dos_secrets() -> Credentials | None:
     try:
         import streamlit as st
-        if "google_token" in st.secrets:
-            info = dict(st.secrets["google_token"])
-            creds = Credentials.from_authorized_user_info(info, SCOPES)
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                return creds
-            if creds and creds.valid:
-                return creds
+
+        if "google_token" not in st.secrets:
+            return None
+        info = dict(st.secrets["google_token"])
     except Exception:
-        pass
+        return None
 
-    # 2. Tenta token.json (local, gerado após primeira autorização)
-    if os.path.exists(CAMINHO_TOKEN):
-        try:
-            creds = Credentials.from_authorized_user_file(CAMINHO_TOKEN, SCOPES)
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                return creds
-            if creds and creds.valid:
-                return creds
-        except Exception:
-            pass  # token.json pode estar corrompido, segue para recriar
+    creds = Credentials.from_authorized_user_info(info, SCOPES)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+    return creds if creds.valid else None
 
-    # 3. Fluxo local — precisa do cliente_oauth.json
+
+def _credenciais_do_token() -> Credentials | None:
+    if not os.path.exists(CAMINHO_TOKEN):
+        return None
+    try:
+        creds = Credentials.from_authorized_user_file(CAMINHO_TOKEN, SCOPES)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds if creds.valid else None
+    except Exception:
+        logger.warning("token.json inválido ou expirado — será refeito o login.")
+        return None
+
+
+def autenticar_usuario() -> Credentials:
+    """
+    Obtém credenciais OAuth na ordem: Secrets → token.json → navegador (local).
+
+    O terceiro caminho abre um servidor local e por isso só funciona na máquina
+    do professor. Na nuvem, a mensagem de erro explica exatamente o que fazer.
+    """
+    for obter in (_credenciais_dos_secrets, _credenciais_do_token):
+        creds = obter()
+        if creds:
+            return creds
+
+    if os.environ.get("STREAMLIT_RUNTIME") or os.environ.get("STREAMLIT_SERVER_HEADLESS"):
+        raise RuntimeError(
+            "Não há credenciais OAuth válidas neste ambiente. Gere o token.json "
+            "na sua máquina e cole o conteúdo dele no bloco [google_token] em "
+            "Settings > Secrets do app."
+        )
+
     if not os.path.exists(CAMINHO_CLIENTE_OAUTH):
         raise FileNotFoundError(
             f"Arquivo 'cliente_oauth.json' não encontrado em '{PASTA_BASE}'.\n"
-            "1. Vá em https://console.cloud.google.com/apis/credentials\n"
-            "2. Clique em '+ CREATE CREDENTIALS' → 'OAuth client ID'\n"
+            "1. Acesse https://console.cloud.google.com/apis/credentials\n"
+            "2. '+ CREATE CREDENTIALS' → 'OAuth client ID'\n"
             "3. Tipo: Desktop app | Nome: Avaliador Forms\n"
-            "4. Baixe o JSON, renomeie para 'cliente_oauth.json' e cole na pasta do projeto."
+            "4. Baixe o JSON, renomeie para 'cliente_oauth.json' e salve na pasta do projeto."
         )
 
-    _validar_json_caminho(CAMINHO_CLIENTE_OAUTH, 'OAuth Client ID')
+    _validar_json_caminho(CAMINHO_CLIENTE_OAUTH, "OAuth Client ID")
 
     flow = InstalledAppFlow.from_client_secrets_file(CAMINHO_CLIENTE_OAUTH, SCOPES)
     creds = flow.run_local_server(port=0)
 
-    with open(CAMINHO_TOKEN, 'w') as token:
+    with open(CAMINHO_TOKEN, "w", encoding="utf-8") as token:
         token.write(creds.to_json())
 
     return creds
 
 
-def _montar_requests_forms(questoes):
-    """Monta a lista de requests do batchUpdate: cabeçalho fixo + questões."""
-    requests = []
-    cabecalho = [
-        "1. Nome Completo:",
-        "2. Turma:",
-        "3. Escola:",
-        "4. Nível de Ensino:",
-        "5. Componente Curricular:",
-    ]
+def _servicos(creds: Credentials) -> dict:
+    return {
+        "forms": build("forms", "v1", credentials=creds, cache_discovery=False),
+        "drive": build("drive", "v3", credentials=creds, cache_discovery=False),
+        "docs": build("docs", "v1", credentials=creds, cache_discovery=False),
+    }
 
-    for i, pergunta in enumerate(cabecalho):
-        requests.append({
-            "createItem": {
-                "item": {
-                    "title": pergunta,
-                    "questionItem": {
-                        "question": {
-                            "required": True,
-                            "textQuestion": {"paragraph": False}
-                        }
+
+# ---------------------------------------------------------------------------
+# Montagem do formulário
+# ---------------------------------------------------------------------------
+def _item_texto(titulo: str, index: int, paragrafo: bool = False) -> dict:
+    return {
+        "createItem": {
+            "item": {
+                "title": titulo,
+                "questionItem": {
+                    "question": {
+                        "required": True,
+                        "textQuestion": {"paragraph": paragrafo},
                     }
                 },
-                "location": {"index": i}
-            }
-        })
+            },
+            "location": {"index": index},
+        }
+    }
+
+
+def _item_multipla_escolha(titulo: str, index: int, questao: dict) -> dict:
+    opcoes = [
+        {"value": f"{letra}) {questao[letra]}"}
+        for letra in LETRAS_ALTERNATIVAS
+        if questao.get(letra)
+    ]
+    return {
+        "createItem": {
+            "item": {
+                "title": titulo,
+                "questionItem": {
+                    "question": {
+                        "required": True,
+                        "choiceQuestion": {"type": "RADIO", "options": opcoes},
+                    }
+                },
+            },
+            "location": {"index": index},
+        }
+    }
+
+
+def montar_requests_forms(questoes: list[dict]) -> list[dict]:
+    """Cabeçalho fixo de identificação + uma questão por item."""
+    requests: list[dict] = [
+        _item_texto(campo, i) for i, campo in enumerate(CAMPOS_IDENTIFICACAO)
+    ]
 
     for i, q in enumerate(questoes):
-        index_atual = i + len(cabecalho)
-        titulo = f"Questão {i + 1}: {q.get('pergunta', '')}"
+        index = i + len(CAMPOS_IDENTIFICACAO)
+        titulo = f"Questão {i + 1}: {q.get('pergunta', '').strip()}"
 
         if q.get("tipo") == "discursiva":
-            item = {
-                "createItem": {
-                    "item": {
-                        "title": titulo,
-                        "questionItem": {
-                            "question": {
-                                "required": True,
-                                "textQuestion": {"paragraph": True}
-                            }
-                        }
-                    },
-                    "location": {"index": index_atual}
-                }
-            }
+            requests.append(_item_texto(titulo, index, paragrafo=True))
         else:
-            opcoes = [
-                {"value": f"{letra}) {q[letra]}"}
-                for letra in ["A", "B", "C", "D", "E"]
-                if q.get(letra)
-            ]
-            item = {
-                "createItem": {
-                    "item": {
-                        "title": titulo,
-                        "questionItem": {
-                            "question": {
-                                "required": True,
-                                "choiceQuestion": {
-                                    "type": "RADIO",
-                                    "options": opcoes
-                                }
-                            }
-                        }
-                    },
-                    "location": {"index": index_atual}
-                }
-            }
-        requests.append(item)
+            requests.append(_item_multipla_escolha(titulo, index, q))
 
     return requests
 
 
-def criar_formulario_ia(questoes_json, disciplina):
-    creds = autenticar_usuario()
-    forms_service = build('forms', 'v1', credentials=creds)
-    drive_service = build('drive', 'v3', credentials=creds)
-
-    questoes = json.loads(questoes_json) if isinstance(questoes_json, str) else questoes_json
-
-    form_body = {
-        "info": {
-            "title": f"Avaliação Inteligente - {disciplina}",
-            "documentTitle": f"Avaliação - {disciplina}"
-        }
-    }
-    form_criado = forms_service.forms().create(body=form_body).execute()
-    form_id = form_criado["formId"]
-
-    requests = _montar_requests_forms(questoes)
-    forms_service.forms().batchUpdate(formId=form_id, body={"requests": requests}).execute()
-
+def _mover_para_pasta(drive_service, file_id: str, id_pasta_destino: str) -> None:
+    """Move o arquivo recém-criado para a pasta da turma, se houver uma."""
+    if not id_pasta_destino:
+        return
     try:
-        form_file = drive_service.files().get(fileId=form_id, fields='parents').execute()
-        previous_parents = ",".join(form_file.get('parents', []))
+        atual = drive_service.files().get(fileId=file_id, fields="parents").execute()
+        pais_antigos = ",".join(atual.get("parents", []))
         drive_service.files().update(
-            fileId=form_id,
-            addParents=ID_DA_PASTA,
-            removeParents=previous_parents,
-            fields='id, parents'
+            fileId=file_id,
+            addParents=id_pasta_destino,
+            removeParents=pais_antigos,
+            fields="id, parents",
         ).execute()
-    except Exception as e:
-        print(f"⚠️ Não foi possível mover o formulário para a pasta do Drive: {e}")
+    except Exception as e:  # noqa: BLE001 — o formulário já existe; mover é secundário
+        logger.warning("Não foi possível mover %s para a pasta do Drive: %s", file_id, e)
 
-    return f"https://docs.google.com/forms/d/{form_id}/edit"
 
-def criar_relatorio_google_docs(nome_aluno, texto_diagnostico, id_pasta_destino):
+def criar_formulario_ia(
+    questoes_json: str | list[dict],
+    disciplina: str,
+    id_pasta_destino: str = "",
+) -> str:
     """
-    Cria um documento no Google Docs com o diagnóstico do aluno e 
-    salva diretamente na pasta do Drive do professor.
+    Cria o Google Forms da avaliação e devolve o link de edição.
+
+    `questoes_json` aceita tanto a string JSON quanto a lista já desserializada.
+    `id_pasta_destino` é opcional: sem ele, o formulário fica na raiz do Drive.
     """
-    # 1. Autentica usando a função que você já tem no arquivo
+    questoes: Any = (
+        json.loads(questoes_json) if isinstance(questoes_json, str) else questoes_json
+    )
+
+    if not isinstance(questoes, list) or not questoes:
+        raise ValueError("A lista de questões está vazia ou em formato inesperado.")
+
     creds = autenticar_usuario()
-    
-    # Conecta com a API do Drive e do Docs
-    from googleapiclient.discovery import build
-    drive_service = build('drive', 'v3', credentials=creds)
-    docs_service = build('docs', 'v1', credentials=creds)
-    
-    # 2. Cria o documento vazio dentro da pasta escolhida
-    metadata_arquivo = {
-        'name': f'Diagnóstico DUA - {nome_aluno}',
-        'mimeType': 'application/vnd.google-apps.document',
-        'parents': [id_pasta_destino]
-    }
-    
-    arquivo = drive_service.files().create(body=metadata_arquivo, fields='id').execute()
-    id_documento = arquivo.get('id')
-    
-    # 3. Insere o texto gerado pela Inteligência Artificial dentro do documento
-    comandos_edicao = [
-        {
-            'insertText': {
-                'location': {'index': 1},
-                'text': texto_diagnostico
+    servicos = _servicos(creds)
+
+    form = servicos["forms"].forms().create(
+        body={
+            "info": {
+                "title": f"Avaliação Inteligente - {disciplina}",
+                "documentTitle": f"Avaliação - {disciplina}",
             }
         }
-    ]
-    
-    docs_service.documents().batchUpdate(
-        documentId=id_documento, 
-        body={'requests': comandos_edicao}
     ).execute()
-    
-    # Retorna o link para o professor poder abrir o Doc na hora
+
+    form_id = form["formId"]
+
+    servicos["forms"].forms().batchUpdate(
+        formId=form_id, body={"requests": montar_requests_forms(questoes)}
+    ).execute()
+
+    _mover_para_pasta(servicos["drive"], form_id, id_pasta_destino)
+
+    logger.info("Formulário criado: %s (%d questões)", form_id, len(questoes))
+    return f"https://docs.google.com/forms/d/{form_id}/edit"
+
+
+# ---------------------------------------------------------------------------
+# Relatório em Google Docs
+# ---------------------------------------------------------------------------
+def criar_relatorio_google_docs(
+    nome_aluno: str,
+    texto_diagnostico: str,
+    id_pasta_destino: str = "",
+) -> str:
+    """Cria um Google Docs com o diagnóstico do aluno e devolve o link."""
+    if not texto_diagnostico.strip():
+        raise ValueError("O diagnóstico está vazio — nada para salvar.")
+
+    creds = autenticar_usuario()
+    servicos = _servicos(creds)
+
+    metadados: dict[str, Any] = {
+        "name": f"Diagnóstico DUA - {nome_aluno}",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+    if id_pasta_destino:
+        metadados["parents"] = [id_pasta_destino]
+
+    arquivo = servicos["drive"].files().create(body=metadados, fields="id").execute()
+    id_documento = arquivo["id"]
+
+    servicos["docs"].documents().batchUpdate(
+        documentId=id_documento,
+        body={
+            "requests": [
+                {"insertText": {"location": {"index": 1}, "text": texto_diagnostico}}
+            ]
+        },
+    ).execute()
+
+    logger.info("Relatório criado para %s: %s", nome_aluno, id_documento)
     return f"https://docs.google.com/document/d/{id_documento}/edit"

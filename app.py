@@ -1,473 +1,694 @@
+"""
+Sistema de Avaliação Inteligente — interface Streamlit.
+
+Fluxo:
+  Aba 1 — material didático, folha de redação e geração da prova no Google Forms
+  Aba 2 — correção multimodal de redações manuscritas (foto → transcrição → DUA)
+  Aba 3 — processamento das notas na planilha e painel da turma
+"""
+
+from __future__ import annotations
+
+import io
 import json
 import os
-import tempfile
+import re
 import traceback
 
 import gspread
 import pandas as pd
 import streamlit as st
 from fpdf import FPDF
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from PIL import Image
 from pypdf import PdfReader
-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-from gerador_forms import criar_formulario_ia, criar_relatorio_google_docs
 
 from avaliador import (
     NOME_MODELO_GEMINI,
+    carregar_json_ia,
     configurar_gemini,
-    extrair_json,
     gerar_com_retry,
     processar_avaliacoes_personalizadas,
 )
-from gerador_forms import criar_formulario_ia
+from config import (
+    ARQUIVO_GABARITO,
+    ID_PASTA_PROVAS,
+    ID_PASTA_REDACOES,
+    NIVEIS_ADAPTATIVOS,
+    logger,
+    obter_config,
+)
+from gerador_forms import (
+    criar_formulario_ia,
+    criar_relatorio_google_docs,
+    extrair_id_pasta,
+    extrair_id_planilha,
+)
 
-
-# ---------------------------------------------------------------------------
-# GERAÇÃO DA FOLHA DE REDAÇÃO EM PDF
-# ---------------------------------------------------------------------------
-class FolhaProducao(FPDF):
-    def header(self):
-        self.set_font("Arial", 'B', 15)
-        self.cell(0, 10, "Folha Oficial de Produção Textual", border=0, ln=True, align='C')
-        self.ln(5)
-
-
-def criar_pdf_redacao(disciplina, tema, genero):
-    pdf = FolhaProducao()
-    pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=15)
-
-    pdf.set_font("Arial", '', 11)
-    pdf.cell(0, 8, "Nome: ________________________________________________________________________", ln=True)
-    pdf.cell(0, 8, f"Componente: {disciplina}              Turma: ____________              Data: ____/____/20___", ln=True)
-    pdf.ln(5)
-
-    pdf.set_fill_color(245, 245, 245)
-    pdf.set_font("Arial", 'B', 11)
-    tema_final = tema if tema.strip() else "Tema Livre"
-    instrucoes = f"Tema Proposto: {tema_final}\nGênero Textual: {genero}"
-    pdf.multi_cell(0, 8, instrucoes, border=1, fill=True, align='L')
-    pdf.ln(10)
-
-    pdf.set_font("Arial", '', 10)
-    pdf.set_text_color(130, 130, 130)
-
-    for i in range(1, 21):
-        y_atual = pdf.get_y()
-        pdf.cell(8, 9, str(i), border=0, align='R')
-        pdf.line(22, y_atual + 6.5, 200, y_atual + 6.5)
-        pdf.ln(9.5)
-
-    caminho_pdf = tempfile.mktemp(suffix=".pdf")
-    pdf.output(caminho_pdf)
-    return caminho_pdf
-
-
-# ---------------------------------------------------------------------------
-# CARREGAMENTO AUTOMÁTICO DO GABARITO (sobrevive ao fechamento do navegador)
-# ---------------------------------------------------------------------------
-def carregar_gabarito_salvo():
-    """Tenta carregar o gabarito do disco se não estiver na sessão."""
-    if "gabarito" in st.session_state:
-        return
-    try:
-        if os.path.exists("ultimo_gabarito.json"):
-            with open("ultimo_gabarito.json", "r", encoding="utf-8") as f:
-                conteudo = f.read().strip()
-            if conteudo:
-                dados = json.loads(conteudo)
-                st.session_state["gabarito"] = dados
-                if isinstance(dados, dict) and any(k in dados for k in ["Baixo", "Regular", "Bom", "Excelente"]):
-                    st.session_state["tipo_gabarito"] = "adaptativo"
-                else:
-                    st.session_state["tipo_gabarito"] = "diagnostico"
-                st.toast("📂 Gabarito anterior carregado automaticamente.", icon="✅")
-    except Exception:
-        pass
-
-
-def salvar_gabarito_em_disco(gabarito):
-    try:
-        with open("ultimo_gabarito.json", "w", encoding="utf-8") as f:
-            json.dump(gabarito, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
-carregar_gabarito_salvo()
-
-
+# set_page_config precisa ser a PRIMEIRA chamada Streamlit do script —
+# na versão anterior um st.toast() rodava antes e derrubava o app.
 st.set_page_config(
     page_title="Sistema de Avaliação Inteligente",
     page_icon="🎓",
-    layout="centered"
+    layout="wide",
 )
 
-st.title("🎓 Sistema de Avaliação Inteligente")
-st.subheader("Análise Pedagógica, Diagnósticos DUA e Criação de Forms Automatizados")
-
-# ---------------------------------------------------------------------------
-# PASSO 1: Upload Multimodal (PDFs/Imagens), Disciplinas
-# ---------------------------------------------------------------------------
-st.markdown("### 📄 Passo 1: Enviar Material Didático e Configurar")
-st.write("Faça o upload dos seus materiais (PDFs ou Imagens) e selecione a disciplina para criar avaliações personalizadas.")
-
-lista_disciplinas = [
+DISCIPLINAS = [
     "Ciências", "Biologia", "Física", "Química", "Geografia",
     "História", "Sociologia", "Filosofia", "Inglês", "Espanhol",
     "Ed. Financeira", "Ed. Digital", "Ed. Ambiental", "Sustentabilidade",
-    "Matemática", "Português", "Robótica", "Programação", "Ed. Física", "Artes"
+    "Matemática", "Português", "Robótica", "Programação", "Ed. Física", "Artes",
 ]
-disciplina_escolhida = st.selectbox("Selecione o Componente Curricular:", lista_disciplinas)
 
-st.markdown("---")
-st.markdown("### 📝 Módulo de Produção Textual")
-st.info("Gere uma folha pautada estruturada para avaliação manuscrita.")
+GENEROS_TEXTUAIS = [
+    "Dissertação-Argumentativa", "Relatório Técnico", "Artigo de Opinião",
+    "Crônica", "Carta Aberta", "Texto Livre",
+]
 
-col_tema, col_genero = st.columns(2)
-with col_tema:
-    tema_redacao = st.text_input("Tema da Produção (deixe em branco para Tema Livre):")
-with col_genero:
-    lista_generos = ["Dissertação-Argumentativa", "Relatório Técnico", "Artigo de Opinião", "Crônica", "Carta Aberta", "Texto Livre"]
-    genero_redacao = st.selectbox("Gênero Textual:", lista_generos)
+ESCOPO_SHEETS = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
 
-if st.button("📄 Gerar Folha em PDF para Impressão"):
-    with st.spinner("Desenhando a folha pautada..."):
-        caminho_arquivo = criar_pdf_redacao(disciplina_escolhida, tema_redacao, genero_redacao)
-        with open(caminho_arquivo, "rb") as f:
-            pdf_bytes = f.read()
-        st.success("Folha gerada com sucesso! Clique abaixo para baixar e imprimir.")
-        st.download_button(
-            label="📥 Baixar Folha de Redação (PDF)",
-            data=pdf_bytes,
-            file_name=f"Folha_Redacao_{disciplina_escolhida}.pdf",
-            mime="application/pdf"
+
+# ===========================================================================
+# PERSISTÊNCIA DO GABARITO
+# ===========================================================================
+def salvar_gabarito_em_disco(gabarito, tipo_gabarito: str) -> None:
+    """Guarda gabarito + tipo juntos, para o app se recuperar de um F5."""
+    try:
+        with open(ARQUIVO_GABARITO, "w", encoding="utf-8") as f:
+            json.dump(
+                {"tipo": tipo_gabarito, "questoes": gabarito},
+                f, ensure_ascii=False, indent=2,
+            )
+    except OSError as e:
+        logger.warning("Não foi possível salvar o gabarito em disco: %s", e)
+
+
+def carregar_gabarito_salvo() -> None:
+    """Restaura o último gabarito do disco, se a sessão ainda não tiver um."""
+    if "gabarito" in st.session_state or not os.path.exists(ARQUIVO_GABARITO):
+        return
+
+    try:
+        with open(ARQUIVO_GABARITO, "r", encoding="utf-8") as f:
+            conteudo = f.read().strip()
+        if not conteudo:
+            return
+
+        dados = json.loads(conteudo)
+
+        if isinstance(dados, dict) and "questoes" in dados:
+            questoes = dados["questoes"]
+            tipo = dados.get("tipo", "diagnostico")
+        else:
+            # formato antigo: lista pura ou dicionário de níveis
+            questoes = dados
+            tipo = (
+                "adaptativo"
+                if isinstance(dados, dict) and any(n in dados for n in NIVEIS_ADAPTATIVOS)
+                else "diagnostico"
+            )
+
+        st.session_state["gabarito"] = questoes
+        st.session_state["tipo_gabarito"] = tipo
+        st.session_state["gabarito_restaurado"] = True
+
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Gabarito salvo ilegível (%s) — ignorando.", e)
+
+
+# ===========================================================================
+# FOLHA DE REDAÇÃO EM PDF
+# ===========================================================================
+class FolhaProducao(FPDF):
+    def header(self) -> None:
+        self.set_font("Helvetica", "B", 15)
+        self.cell(0, 10, "Folha Oficial de Produção Textual", align="C")
+        self.ln(12)
+
+    def footer(self) -> None:
+        self.set_y(-15)
+        self.set_font("Helvetica", "", 8)
+        self.set_text_color(130, 130, 130)
+        self.cell(0, 10, f"Página {self.page_no()}", align="C")
+
+
+@st.cache_data(show_spinner=False)
+def criar_pdf_redacao(
+    disciplina: str,
+    tema: str,
+    genero: str,
+    linhas: int = 20,
+) -> bytes:
+    """
+    Devolve o PDF em bytes.
+
+    A versão anterior usava tempfile.mktemp(), que é inseguro e deixa lixo no
+    disco do servidor a cada clique. Trabalhar em memória resolve os dois.
+    """
+    pdf = FolhaProducao()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, "Nome: " + "_" * 72)
+    pdf.ln(8)
+    pdf.cell(
+        0, 8,
+        f"Componente: {disciplina}        Turma: ____________        Data: ____/____/20___",
+    )
+    pdf.ln(12)
+
+    pdf.set_fill_color(245, 245, 245)
+    pdf.set_font("Helvetica", "B", 11)
+    tema_final = (tema or "").strip() or "Tema Livre"
+    pdf.multi_cell(
+        0, 8,
+        f"Tema proposto: {tema_final}\nGênero textual: {genero}",
+        border=1, fill=True, align="L",
+    )
+    pdf.ln(8)
+
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(130, 130, 130)
+    for i in range(1, linhas + 1):
+        y = pdf.get_y()
+        pdf.cell(8, 9, str(i), align="R")
+        pdf.line(22, y + 6.5, 200, y + 6.5)
+        pdf.ln(9.5)
+
+    saida = pdf.output()
+    return bytes(saida)
+
+
+# ===========================================================================
+# LEITURA DO MATERIAL DIDÁTICO
+# ===========================================================================
+@st.cache_data(show_spinner=False)
+def _extrair_texto_pdf(conteudo: bytes) -> str:
+    """Cacheado pelo conteúdo do arquivo: não relê o PDF a cada rerun."""
+    leitor = PdfReader(io.BytesIO(conteudo))
+    return "\n".join((pagina.extract_text() or "") for pagina in leitor.pages)
+
+
+def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
+    """Separa PDFs (texto) e imagens (multimodal). Devolve (pacote, aviso)."""
+    pacote: list = []
+    texto_total = ""
+    avisos: list[str] = []
+
+    for arquivo in arquivos or []:
+        try:
+            if arquivo.type == "application/pdf":
+                texto = _extrair_texto_pdf(arquivo.getvalue())
+                if texto.strip():
+                    texto_total += texto + "\n"
+                else:
+                    avisos.append(
+                        f"'{arquivo.name}' parece ser um PDF digitalizado sem texto. "
+                        "Envie como imagem para a IA conseguir ler."
+                    )
+            else:
+                pacote.append(Image.open(arquivo))
+        except Exception as e:  # noqa: BLE001
+            avisos.append(f"Não foi possível ler '{arquivo.name}': {e}")
+
+    if texto_total.strip():
+        pacote.append(texto_total)
+
+    return pacote, " ".join(avisos)
+
+
+# ===========================================================================
+# PROMPTS
+# ===========================================================================
+def montar_prompt_prova(
+    disciplina: str,
+    total_questoes: int,
+    objetivas: int,
+    discursivas: int,
+    adaptativa: bool,
+) -> str:
+    regra_interdisciplinar = ""
+    if disciplina not in ("Português", "Matemática"):
+        regra_interdisciplinar = (
+            "REGRA DE INTERDISCIPLINARIDADE: sempre que o conteúdo permitir, "
+            "integre raciocínio lógico-matemático ou interpretação de texto aprofundada."
         )
 
-st.markdown("---")
+    if adaptativa:
+        instrucao_saida = f"""
+Crie 4 provas diferentes a partir deste material, cada uma com exatamente {total_questoes} questões,
+ajustando o nível cognitivo: 'Baixo' (direta e básica), 'Regular' (intermediária),
+'Bom' (análise e relação) e 'Excelente' (alta complexidade e síntese).
 
-materiais_didaticos = st.file_uploader(
-    "Escolha seus materiais (PDF, PNG, JPG)",
-    type=["pdf", "png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-    key="uploader_materiais_didaticos"
-)
-
-# ---------------------------------------------------------------------------
-# BLOCO 2: Correção Multimodal de Redações Manuscritas
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.markdown("### 👁️ Bloco 2: Laboratório de Letramento e Correção Multimodal")
-st.info("Tirou a foto da redação do aluno? Faça o upload aqui para o sistema transcrever, corrigir a gramática e avaliar a estrutura textual.")
-
-foto_redacao = st.file_uploader(
-    "Escolha a(s) foto(s) da redação manuscrita",
-    type=["pdf", "png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-    key="uploader_foto_redacao"
-)
-
-col_tema_corr, col_gen_corr = st.columns(2)
-with col_tema_corr:
-    tema_alvo = st.text_input("Tema proposto na atividade (ex: Segurança no Trabalho):")
-with col_gen_corr:
-    genero_alvo = st.selectbox("Gênero Textual cobrado:", ["Dissertação-Argumentativa", "Relatório Técnico", "Crônica", "Artigo de Opinião", "Texto Livre"])
-
-if st.button("🪄 Transcrever, Corrigir e Diagnosticar"):
-    if foto_redacao:
-        with st.spinner("A IA está lendo a caligrafia, corrigindo a gramática e elaborando o diagnóstico..."):
-            try:
-                imagens_aluno = [Image.open(foto) for foto in foto_redacao]
-                cliente_genai = configurar_gemini()
-
-                prompt_correcao = f"""
-                Atue como um professor avaliador rigoroso e empático de linguagens.
-                Leia o texto manuscrito na(s) imagem(ns) anexa(s).
-                
-                Sua primeira tarefa é identificar o nome do aluno que está preenchido à mão no cabeçalho da folha (no campo "Nome:").
-                
-                Tema proposto ao aluno: {tema_alvo}
-                Gênero Textual exigido: {genero_alvo}
-                
-                Devolva uma análise estruturada em Markdown contendo EXATAMENTE estes tópicos:
-                
-                ### 📝 1. Transcrição Fiel
-                (Transcreva o que o aluno escreveu. Se alguma palavra estiver totalmente ilegível, coloque [ilegível]).
-                
-                ### 🚨 2. Análise Gramatical (Norma-Padrão)
-                (Aponte com clareza os desvios de ortografia, concordância, regência ou pontuação).
-                
-                ### 🏗️ 3. Análise de Estrutura Textual e Tema
-                (Avalie se o texto respeita a estrutura do gênero '{genero_alvo}' e se abordou adequadamente o tema proposto).
-                
-                ### 📊 4. Nota Sugerida
-                (Atribua uma nota justa de 0 a 10 baseada nos critérios acima, explicando rapidamente o peso).
-                
-                ### 🧠 5. Diagnóstico DUA de [INSERIR AQUI O NOME LIDO NO CABEÇALHO]
-                (Inicie o texto chamando o aluno pelo nome, por exemplo: "Olá, [Nome], ...". Forneça um diagnóstico pedagógico estruturado no Desenho Universal para a Aprendizagem. Sugira 1 ou 2 intervenções práticas para ajudar este aluno específico a superar as barreiras de escrita identificadas).
-                """
-
-                # ... [O restante do seu código que chama a IA fica aqui em cima] ...
-                pacote_para_ia = [prompt_correcao] + imagens_aluno
-                resposta = gerar_com_retry(cliente_genai, NOME_MODELO_GEMINI, pacote_para_ia)
-                
-                # 1. Salva o texto na memória para o botão de salvar não desaparecer!
-                st.session_state["diagnostico_atual"] = resposta.text
-                st.success("Análise concluída com sucesso!")
-                
-            except Exception as e:
-                st.error(f"Erro durante a leitura multimodal: {str(e)}")
+Devolva um único objeto JSON no formato de dicionário com as 4 listas:
+{{
+  "Baixo": [{{"tipo": "objetiva", "pergunta": "...", "A": "...", "B": "...", "C": "...", "D": "...", "E": "...", "correta": "C"}}],
+  "Regular": [...],
+  "Bom": [...],
+  "Excelente": [...]
+}}
+"""
     else:
-        st.warning("⚠️ Por favor, faça o upload da(s) foto(s) da redação antes de clicar em analisar.")
+        instrucao_saida = f"""
+Crie uma avaliação única e equilibrada para toda a turma, com exatamente {total_questoes} questões.
 
-# 2. ESTE BLOCO FICA TOTALMENTE FORA DO BOTÃO DE "TRANSCREVER"
-if "diagnostico_atual" in st.session_state:
-    # Exibe o texto da IA na tela
-    st.markdown(st.session_state["diagnostico_atual"])
-    
-    st.markdown("---")
-    st.write("#### 💾 Salvar Avaliação no Google Drive")
-    
-    # Substitua pelo ID real da pasta que você copiou no Passo 1
-    ID_PASTA_REDACAO = "18uvref4E9loqwTkxy-tIWR31jsLjan0b" 
-    
-    if st.button("📄 Salvar Relatório (Google Docs)"):
-        with st.spinner("Criando documento no Google Drive..."):
-            try:
-                # Dica: Futuramente podemos puxar o nome que a IA leu do cabeçalho
-                nome_aluno_formatado = "Aluno da Redação" 
-                
-                link_doc = criar_relatorio_google_docs(
-                    nome_aluno=nome_aluno_formatado,
-                    texto_diagnostico=st.session_state["diagnostico_atual"],
-                    id_pasta_destino=ID_PASTA_REDACAO
-                )
-                
-                st.success("✅ Relatório salvo com sucesso na sua pasta do Drive!")
-                st.markdown(f"[🔗 **CLIQUE AQUI PARA ABRIR O GOOGLE DOCS**]({link_doc})")
-                
-            except Exception as e:
-                st.error(f"Ocorreu um erro ao salvar: {str(e)}")
+Devolva EXATAMENTE uma lista JSON:
+[
+  {{"tipo": "objetiva", "pergunta": "...", "A": "...", "B": "...", "C": "...", "D": "...", "E": "...", "correta": "C"}},
+  {{"tipo": "discursiva", "pergunta": "...", "criterio_correcao": "..."}}
+]
+"""
 
-else:
-    st.warning("⚠️ Por favor, faça o upload da(s) foto(s) da redação antes de clicar em analisar.")
+    return f"""
+Atue como um professor especialista em {disciplina}.
+Leia o material de apoio fornecido e construa a avaliação.
+{regra_interdisciplinar}
 
-# ---------------------------------------------------------------------------
-# Extração de texto/imagens do material didático (Passo 1)
-# ---------------------------------------------------------------------------
-conteudo_para_ia = []
-texto_extraido_total = ""
+REGRAS DE ESTRUTURAÇÃO (para cada prova gerada):
+1. {objetivas} questões objetivas, múltipla escolha de A a E, com o campo "correta" indicando a letra.
+2. {discursivas} questões discursivas, com "pergunta" e "criterio_correcao" (valendo até 2,0 pontos).
+3. Não use aspas duplas dentro dos textos; se precisar citar, use aspas simples.
+4. Não use quebras de linha literais dentro dos valores JSON.
+5. Devolva apenas o JSON, sem comentários e sem blocos de código.
 
-if materiais_didaticos:
-    try:
-        for arquivo in materiais_didaticos:
-            if arquivo.type == "application/pdf":
-                leitor_pdf = PdfReader(arquivo)
-                for pagina in leitor_pdf.pages:
-                    texto_extraido_total += (pagina.extract_text() or "") + "\n"
-            else:
-                conteudo_para_ia.append(Image.open(arquivo))
-
-        if texto_extraido_total:
-            conteudo_para_ia.append(texto_extraido_total)
-
-    except Exception as e:
-        st.error(f"Erro ao processar os materiais didáticos: {str(e)}")
-
-st.markdown("### 🧠 Passo 2: Gerar Avaliação e Formulário")
-st.write("#### ⚙️ Configuração da Avaliação")
-
-tipo_avaliacao = st.radio(
-    "Selecione o formato da prova:",
-    ["Diagnóstica (1 Formulário para a turma toda)", "Adaptativa (4 Formulários por Nível)"],
-    horizontal=True
-)
-st.write("---")
-
-total_questoes = st.slider("Total de questões da avaliação", min_value=1, max_value=10, value=8)
-questoes_discursivas_n = st.slider("Quantas dessas serão discursivas?", min_value=0, max_value=total_questoes, value=2)
-questoes_objetivas_n = total_questoes - questoes_discursivas_n
-
-st.info(f"A IA vai gerar um formulário com **{questoes_objetivas_n} questões objetivas** e **{questoes_discursivas_n} questões discursivas**.")
-
-if st.button(f"Gerar Prova de {disciplina_escolhida} no Google Forms", type="primary"):
-    with st.spinner("A IA está analisando os materiais, formulando as questões e construindo o Google Forms..."):
-        try:
-            client = configurar_gemini()
-
-            regra_interdisciplinar = ""
-            if disciplina_escolhida not in ["Português", "Matemática"]:
-                regra_interdisciplinar = """
-                REGRA DE INTERDISCIPLINARIDADE: As questões devem instigar o raciocínio crítico.
-                Sempre que o contexto permitir, integre a aplicação de raciocínio lógico-matemático
-                ou exija uma interpretação de texto aprofundada.
-                """
-
-            if "Adaptativa" in tipo_avaliacao:
-                instrucao_saida = f"""
-                Crie 4 provas diferentes a partir deste material (cada uma contendo exatamente {total_questoes} questões).
-                Ajuste o nível cognitivo das questões para cada grupo:
-                - 'Baixo' (questões diretas e básicas), 'Regular' (intermediárias), 'Bom' (análise e relação) e 'Excelente' (alta complexidade e síntese).
-                DEVOLUÇÃO OBRIGATÓRIA: Devolva um único arquivo JSON no formato de DICIONÁRIO contendo 4 listas:
-                {{
-                    "Baixo": [ {{"tipo": "objetiva", "pergunta": "...", "A": "...", "correta": "C"}} ],
-                    "Regular": [ ... ],
-                    "Bom": [ ... ],
-                    "Excelente": [ ... ]
-                }}
-                """
-                tipo_gabarito = "adaptativo"
-            else:
-                instrucao_saida = f"""
-                Crie uma avaliação única e equilibrada para toda a turma (contendo exatamente {total_questoes} questões).
-                DEVOLUÇÃO OBRIGATÓRIA: Devolva a prova EXATAMENTE no formato JSON de LISTA, como no exemplo abaixo:
-                [
-                    {{"tipo": "objetiva", "pergunta": "...", "A": "...", "correta": "C"}}
-                ]
-                """
-                tipo_gabarito = "diagnostico"
-
-            prompt = f"""
-            Atue como um professor especialista em {disciplina_escolhida}.
-            Leia o material de apoio fornecido e construa a(s) avaliação(ões).
-            {regra_interdisciplinar}
-
-            REGRAS DE ESTRUTURAÇÃO (Para CADA prova gerada):
-            1. Questões Objetivas (Total: {questoes_objetivas_n}): Formato de múltipla escolha com alternativas de A a E.
-            2. Questões Discursivas (Total: {questoes_discursivas_n}): Formato de resposta aberta. Forneça a "pergunta" e um "criterio_correcao" (valendo no máximo 2,0 pontos).
-            3. REGRA CRÍTICA DE FORMATAÇÃO: É ESTRITAMENTE PROIBIDO usar aspas duplas (" ") dentro do texto das perguntas, alternativas ou critérios. Se precisar citar, use aspas simples (' ').
-            4. NÃO use quebras de linha literais dentro dos valores JSON. Use \\n se necessário.
-
-            {instrucao_saida}
-            """
-
-            pacote_para_ia = [prompt] + conteudo_para_ia
-            resposta = gerar_com_retry(client, NOME_MODELO_GEMINI, pacote_para_ia)
-
-            try:
-                texto_limpo = extrair_json(resposta.text)
-                questoes_json = json.loads(texto_limpo, strict=False)
-            except (ValueError, json.JSONDecodeError) as e:
-                st.error(f"🚨 A IA não retornou o formato de dados corretamente! Erro: {e}")
-                st.info("Veja abaixo a resposta bruta da IA para análise:")
-                st.code(resposta.text, language="text")
-                st.stop()
-
-            st.session_state["gabarito"] = questoes_json
-            st.session_state["tipo_gabarito"] = tipo_gabarito
-            salvar_gabarito_em_disco(questoes_json)
-
-            if "Adaptativa" in tipo_avaliacao:
-                st.write("### 🔗 Avaliações Adaptativas Geradas:")
-                for nivel, lista_questoes in questoes_json.items():
-                    texto_nivel = json.dumps(lista_questoes, ensure_ascii=False)
-                    nome_prova_nivel = f"{disciplina_escolhida} (Nível {nivel})"
-                    link_nivel = criar_formulario_ia(texto_nivel, nome_prova_nivel)
-                    st.markdown(f"- **Grupo {nivel}:** [Acessar Google Forms]({link_nivel})")
-                st.success("🎉 Os 4 formulários adaptativos foram gerados com sucesso!")
-            else:
-                link_forms = criar_formulario_ia(texto_limpo, disciplina_escolhida)
-                st.success("🎉 Avaliação e Formulário gerados com sucesso!")
-                st.markdown(f"### 🔗 [CLIQUE AQUI PARA ACESSAR O SEU GOOGLE FORMS]({link_forms})")
-
-            with st.expander("Ver código (Gabarito Oficial)"):
-                st.code(texto_limpo, language="json")
-
-        except Exception as e:
-            st.error(f"Erro durante o processamento: {str(e)}")
-
-# ---------------------------------------------------------------------------
-# PASSO 3: Gestão de Notas e Diagnósticos DUA
-# ---------------------------------------------------------------------------
-st.markdown("---")
-st.markdown("### 📊 Passo 3: Gestão de Notas e Diagnósticos DUA")
-st.info("💡 Cole abaixo o link ou o ID da planilha exclusiva gerada por esta avaliação para processar as notas e gerar as intervenções baseadas no DUA.")
-
-entrada_planilha = st.text_input("Link ou ID da Planilha do Google Sheets:", placeholder="Cole aqui o link ou o ID da planilha...")
+{instrucao_saida}
+""".strip()
 
 
-def extrair_id_planilha(texto):
-    if "spreadsheets/d/" in texto:
-        partes = texto.split("spreadsheets/d/")
-        if len(partes) > 1:
-            return partes[1].split("/")[0]
-    return texto.strip()
+def montar_prompt_redacao(tema: str, genero: str) -> str:
+    return f"""
+Atue como um professor avaliador rigoroso e empático da área de linguagens.
+Leia o texto manuscrito na(s) imagem(ns) anexa(s).
+
+Tema proposto: {tema or "(não informado)"}
+Gênero textual exigido: {genero}
+
+Comece a resposta com uma única linha exatamente neste formato:
+NOME_DETECTADO: <nome que estiver escrito à mão no campo "Nome:" do cabeçalho, ou DESCONHECIDO>
+
+Em seguida, devolva a análise em Markdown com EXATAMENTE estes tópicos:
+
+### 1. Transcrição fiel
+Transcreva o que o aluno escreveu. Marque trechos ilegíveis com [ilegível].
+
+### 2. Análise gramatical (norma-padrão)
+Aponte desvios de ortografia, concordância, regência e pontuação.
+
+### 3. Estrutura textual e adequação ao tema
+Avalie se o texto respeita a estrutura do gênero '{genero}' e se atende ao tema.
+
+### 4. Nota sugerida
+Atribua uma nota de 0 a 10, explicando brevemente o peso de cada critério.
+
+### 5. Diagnóstico DUA
+Dirija-se ao aluno pelo nome. Traga um diagnóstico pedagógico baseado no Desenho
+Universal para a Aprendizagem, com 1 ou 2 intervenções práticas para superar as
+barreiras de escrita identificadas.
+""".strip()
 
 
-ESCOPO_SHEETS = ["https://www.googleapis.com/auth/spreadsheets"]
+def separar_nome_detectado(resposta: str) -> tuple[str, str]:
+    """Extrai a linha NOME_DETECTADO e devolve (nome, texto_restante)."""
+    m = re.search(r"^\s*NOME_DETECTADO:\s*(.+)$", resposta, re.MULTILINE)
+    if not m:
+        return "Aluno não identificado", resposta
+
+    nome = m.group(1).strip()
+    if nome.upper() in ("DESCONHECIDO", "N/A", ""):
+        nome = "Aluno não identificado"
+
+    return nome, resposta[: m.start()] + resposta[m.end():]
 
 
-def conectar_sheets(id_planilha):
-    # No Streamlit Community Cloud não existe arquivo local de credenciais —
-    # nesse caso, o service account é lido dos Secrets do app
-    # (bloco [gcp_service_account] em Settings > Secrets).
+# ===========================================================================
+# GOOGLE SHEETS
+# ===========================================================================
+@st.cache_resource(show_spinner=False)
+def _cliente_sheets():
+    """Autoriza uma vez por sessão do servidor, em vez de a cada clique."""
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
-        credenciais = ServiceAccountCredentials.from_service_account_info(info, scopes=ESCOPO_SHEETS)
+        credenciais = ServiceAccountCredentials.from_service_account_info(
+            info, scopes=ESCOPO_SHEETS
+        )
     else:
-        caminho_credenciais = os.environ.get("GOOGLE_CREDENTIALS_PATH", "credenciais.json")
-        credenciais = ServiceAccountCredentials.from_service_account_file(caminho_credenciais, scopes=ESCOPO_SHEETS)
+        caminho = obter_config("GOOGLE_CREDENTIALS_PATH", "credenciais.json")
+        if not os.path.exists(caminho):
+            raise FileNotFoundError(
+                f"Credenciais da conta de serviço não encontradas em '{caminho}'. "
+                "Configure GOOGLE_CREDENTIALS_PATH ou o bloco [gcp_service_account] nos Secrets."
+            )
+        credenciais = ServiceAccountCredentials.from_service_account_file(
+            caminho, scopes=ESCOPO_SHEETS
+        )
 
-    cliente = gspread.authorize(credenciais)
-    return cliente.open_by_key(id_planilha).sheet1
+    return gspread.authorize(credenciais)
 
 
-col1, col2 = st.columns(2)
+def conectar_sheets(id_planilha: str):
+    try:
+        return _cliente_sheets().open_by_key(id_planilha).sheet1
+    except gspread.exceptions.APIError as e:
+        raise RuntimeError(
+            "Não foi possível abrir a planilha. Confira o link e verifique se ela "
+            "foi compartilhada com o e-mail da conta de serviço (permissão de Editor)."
+        ) from e
 
-with col1:
-    if st.button("🚀 Processar Avaliações"):
-        if not entrada_planilha:
-            st.warning("Informe o link ou o ID da planilha.")
-        elif "gabarito" not in st.session_state:
-            st.warning("Gabarito não encontrado. Gere a prova no Passo 2.")
+
+# ===========================================================================
+# INTERFACE
+# ===========================================================================
+carregar_gabarito_salvo()
+
+st.title("🎓 Sistema de Avaliação Inteligente")
+st.caption("Análise pedagógica, diagnósticos DUA e criação automatizada de formulários")
+
+if st.session_state.pop("gabarito_restaurado", False):
+    st.toast("Gabarito anterior carregado automaticamente.", icon="📂")
+
+with st.sidebar:
+    st.header("⚙️ Configurações")
+    disciplina_escolhida = st.selectbox("Componente curricular:", DISCIPLINAS)
+
+    st.divider()
+    st.caption("Pastas do Google Drive (opcional — deixe em branco para usar a raiz)")
+    entrada_pasta_provas = st.text_input(
+        "Pasta das provas:", value=ID_PASTA_PROVAS,
+        placeholder="Cole o link da pasta da turma...",
+    )
+    entrada_pasta_redacoes = st.text_input(
+        "Pasta das redações:", value=ID_PASTA_REDACOES,
+        placeholder="Cole o link da pasta de redações...",
+    )
+
+    st.divider()
+    if "gabarito" in st.session_state:
+        tipo = st.session_state.get("tipo_gabarito", "diagnostico")
+        st.success(f"Gabarito em memória ({tipo}).")
+    else:
+        st.info("Nenhum gabarito carregado.")
+
+id_pasta_provas = extrair_id_pasta(entrada_pasta_provas)
+id_pasta_redacoes = extrair_id_pasta(entrada_pasta_redacoes)
+
+aba_prova, aba_redacao, aba_notas = st.tabs(
+    ["📄 Material e Prova", "👁️ Correção de Redações", "📊 Notas e Diagnósticos"]
+)
+
+# ---------------------------------------------------------------------------
+# ABA 1 — material didático, folha de redação e geração da prova
+# ---------------------------------------------------------------------------
+with aba_prova:
+    st.subheader("📝 Folha pautada para produção textual")
+    col_tema, col_genero, col_linhas = st.columns([2, 2, 1])
+    with col_tema:
+        tema_redacao = st.text_input("Tema (em branco = Tema Livre):")
+    with col_genero:
+        genero_redacao = st.selectbox("Gênero textual:", GENEROS_TEXTUAIS)
+    with col_linhas:
+        num_linhas = st.number_input("Linhas:", min_value=10, max_value=30, value=20)
+
+    # O PDF é gerado direto no download_button: sem clique duplo e sem
+    # arquivo temporário sobrando no servidor.
+    st.download_button(
+        "📥 Baixar folha de redação (PDF)",
+        data=criar_pdf_redacao(
+            disciplina_escolhida, tema_redacao, genero_redacao, int(num_linhas)
+        ),
+        file_name=f"Folha_Redacao_{disciplina_escolhida}.pdf",
+        mime="application/pdf",
+    )
+
+    st.divider()
+    st.subheader("📚 Material didático")
+    materiais = st.file_uploader(
+        "Envie PDFs ou imagens do conteúdo que servirá de base para a prova",
+        type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="uploader_materiais",
+    )
+
+    st.divider()
+    st.subheader("🧠 Gerar avaliação no Google Forms")
+
+    tipo_avaliacao = st.radio(
+        "Formato da prova:",
+        ["Diagnóstica (1 formulário para a turma)", "Adaptativa (4 formulários por nível)"],
+        horizontal=True,
+    )
+    adaptativa = "Adaptativa" in tipo_avaliacao
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        total_questoes = st.slider("Total de questões", 1, 10, 8)
+    with col_b:
+        questoes_discursivas = st.slider("Dessas, quantas discursivas", 0, total_questoes, 2)
+    questoes_objetivas = total_questoes - questoes_discursivas
+
+    st.info(
+        f"Serão geradas **{questoes_objetivas} questões objetivas** e "
+        f"**{questoes_discursivas} discursivas**"
+        + (" para cada um dos 4 níveis." if adaptativa else ".")
+    )
+
+    # Um único botão de geração — antes havia três widgets duplicados,
+    # o que provoca erro de ID repetido no Streamlit.
+    if st.button(f"Gerar prova de {disciplina_escolhida}", type="primary"):
+        if not materiais:
+            st.warning("Envie ao menos um material didático antes de gerar a prova.")
+            st.stop()
+
+        conteudo_para_ia, aviso = preparar_conteudo_para_ia(materiais)
+        if aviso:
+            st.warning(aviso)
+        if not conteudo_para_ia:
+            st.error("Nenhum conteúdo legível foi extraído dos arquivos enviados.")
+            st.stop()
+
+        with st.spinner("A IA está formulando as questões..."):
+            try:
+                client = configurar_gemini()
+                prompt = montar_prompt_prova(
+                    disciplina_escolhida, total_questoes,
+                    questoes_objetivas, questoes_discursivas, adaptativa,
+                )
+                resposta = gerar_com_retry(
+                    client, NOME_MODELO_GEMINI, [prompt] + conteudo_para_ia
+                )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Falha ao chamar a IA: {e}")
+                st.stop()
+
+        try:
+            questoes_json = carregar_json_ia(resposta.text)
+        except ValueError as e:
+            st.error(f"A IA não devolveu o formato de dados esperado. {e}")
+            with st.expander("Ver resposta bruta da IA"):
+                st.code(resposta.text, language="text")
+            st.stop()
+
+        # Só depois de o JSON existir é que os formulários são criados —
+        # na versão anterior a criação vinha antes e quebrava com NameError.
+        tipo_gabarito = "adaptativo" if adaptativa else "diagnostico"
+        st.session_state["gabarito"] = questoes_json
+        st.session_state["tipo_gabarito"] = tipo_gabarito
+        salvar_gabarito_em_disco(questoes_json, tipo_gabarito)
+
+        with st.spinner("Criando o(s) formulário(s) no Google Forms..."):
+            try:
+                if adaptativa:
+                    if not isinstance(questoes_json, dict):
+                        st.error("A IA devolveu uma lista, mas o modo adaptativo exige 4 níveis.")
+                        st.stop()
+
+                    st.write("### 🔗 Avaliações adaptativas geradas")
+                    for nivel, lista in questoes_json.items():
+                        link = criar_formulario_ia(
+                            lista, f"{disciplina_escolhida} (Nível {nivel})", id_pasta_provas
+                        )
+                        st.markdown(f"- **Grupo {nivel}:** [Abrir Google Forms]({link})")
+                    st.success("Os 4 formulários adaptativos foram criados.")
+                else:
+                    if not isinstance(questoes_json, list):
+                        st.error("A IA devolveu um dicionário, mas o modo diagnóstico exige uma lista.")
+                        st.stop()
+
+                    link = criar_formulario_ia(
+                        questoes_json, disciplina_escolhida, id_pasta_provas
+                    )
+                    st.success("Avaliação e formulário criados.")
+                    st.markdown(f"### 🔗 [Abrir o Google Forms]({link})")
+
+                st.caption(
+                    "Lembre-se de vincular o formulário a uma planilha de respostas "
+                    "(Respostas → Vincular ao Sheets) e usar esse link na aba de notas."
+                )
+            except Exception as e:  # noqa: BLE001
+                st.error(f"O gabarito foi salvo, mas houve falha ao criar o formulário: {e}")
+
+        with st.expander("Ver gabarito oficial (JSON)"):
+            st.code(json.dumps(questoes_json, ensure_ascii=False, indent=2), language="json")
+
+# ---------------------------------------------------------------------------
+# ABA 2 — correção multimodal de redações
+# ---------------------------------------------------------------------------
+with aba_redacao:
+    st.subheader("👁️ Laboratório de letramento e correção multimodal")
+    st.info("Envie a foto da redação manuscrita para transcrever, corrigir e diagnosticar.")
+
+    fotos_redacao = st.file_uploader(
+        "Foto(s) da redação manuscrita",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="uploader_redacao",
+    )
+
+    col_t, col_g = st.columns(2)
+    with col_t:
+        tema_alvo = st.text_input("Tema proposto na atividade:", key="tema_correcao")
+    with col_g:
+        genero_alvo = st.selectbox("Gênero cobrado:", GENEROS_TEXTUAIS, key="genero_correcao")
+
+    if st.button("🪄 Transcrever, corrigir e diagnosticar"):
+        if not fotos_redacao:
+            st.warning("Envie ao menos uma foto da redação antes de analisar.")
         else:
-            with st.spinner("Processando..."):
+            with st.spinner("A IA está lendo a caligrafia e elaborando o diagnóstico..."):
+                try:
+                    imagens = [Image.open(foto) for foto in fotos_redacao]
+                    client = configurar_gemini()
+                    resposta = gerar_com_retry(
+                        client,
+                        NOME_MODELO_GEMINI,
+                        [montar_prompt_redacao(tema_alvo, genero_alvo)] + imagens,
+                    )
+
+                    nome_aluno, texto = separar_nome_detectado(resposta.text)
+                    st.session_state["diagnostico_atual"] = texto.strip()
+                    st.session_state["nome_aluno_redacao"] = nome_aluno
+                    st.success("Análise concluída.")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Erro durante a leitura multimodal: {e}")
+
+    # Fica FORA do bloco do botão para o resultado sobreviver ao rerun —
+    # antes, o 'else' desse bloco exibia um aviso indevido o tempo todo.
+    if "diagnostico_atual" in st.session_state:
+        st.divider()
+        nome_aluno = st.text_input(
+            "Nome do aluno (detectado pela IA — corrija se necessário):",
+            value=st.session_state.get("nome_aluno_redacao", ""),
+        )
+        st.markdown(st.session_state["diagnostico_atual"])
+
+        st.divider()
+        col_salvar, col_limpar = st.columns([3, 1])
+
+        with col_salvar:
+            if st.button("📄 Salvar relatório no Google Docs"):
+                with st.spinner("Criando documento no Drive..."):
+                    try:
+                        link_doc = criar_relatorio_google_docs(
+                            nome_aluno=nome_aluno or "Aluno não identificado",
+                            texto_diagnostico=st.session_state["diagnostico_atual"],
+                            id_pasta_destino=id_pasta_redacoes,
+                        )
+                        st.success("Relatório salvo no Drive.")
+                        st.markdown(f"[🔗 Abrir o Google Docs]({link_doc})")
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Não foi possível salvar: {e}")
+
+        with col_limpar:
+            if st.button("🗑️ Limpar"):
+                st.session_state.pop("diagnostico_atual", None)
+                st.session_state.pop("nome_aluno_redacao", None)
+                st.rerun()
+
+# ---------------------------------------------------------------------------
+# ABA 3 — notas e diagnósticos
+# ---------------------------------------------------------------------------
+with aba_notas:
+    st.subheader("📊 Gestão de notas e diagnósticos DUA")
+    st.info("Cole o link da planilha de respostas vinculada a esta avaliação.")
+
+    entrada_planilha = st.text_input(
+        "Link ou ID da planilha do Google Sheets:",
+        placeholder="https://docs.google.com/spreadsheets/d/...",
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("🚀 Processar avaliações", type="primary"):
+            if not entrada_planilha:
+                st.warning("Informe o link ou o ID da planilha.")
+            elif "gabarito" not in st.session_state:
+                st.warning("Nenhum gabarito em memória. Gere a prova na primeira aba.")
+            else:
+                barra = st.progress(0.0, text="Iniciando...")
+
+                def atualizar(atual: int, total: int, nome: str) -> None:
+                    barra.progress(min(atual / max(total, 1), 1.0), text=f"Corrigindo: {nome}")
+
                 try:
                     folha = conectar_sheets(extrair_id_planilha(entrada_planilha))
-                    processar_avaliacoes_personalizadas(
+                    resumo = processar_avaliacoes_personalizadas(
                         folha,
                         st.session_state["gabarito"],
-                        st.session_state.get("tipo_gabarito", "diagnostico")
+                        st.session_state.get("tipo_gabarito", "diagnostico"),
+                        progresso=atualizar,
                     )
-                    st.success("✅ Notas e diagnósticos atualizados!")
-                except Exception:
-                    st.error("❌ ERRO DETALHADO:")
-                    st.code(traceback.format_exc(), language="python")
+                    barra.empty()
+                    st.success(
+                        f"✅ {resumo['corrigidos']} aluno(s) corrigido(s) · "
+                        f"{resumo['ignorados']} ignorado(s) · {resumo['erros']} com erro."
+                    )
+                except Exception:  # noqa: BLE001
+                    barra.empty()
+                    st.error("Falha ao processar as avaliações.")
+                    with st.expander("Detalhes técnicos"):
+                        st.code(traceback.format_exc(), language="python")
 
-with col2:
-    if st.button("📊 Visualizar Alunos na Planilha"):
-        if not entrada_planilha:
-            st.warning("Por favor, informe o link ou o ID da planilha para visualizar.")
-        else:
-            try:
-                folha = conectar_sheets(extrair_id_planilha(entrada_planilha))
-                dados_brutos = folha.get_all_values()
+    with col2:
+        if st.button("📋 Visualizar turma"):
+            if not entrada_planilha:
+                st.warning("Informe o link ou o ID da planilha.")
+            else:
+                try:
+                    folha = conectar_sheets(extrair_id_planilha(entrada_planilha))
+                    dados = folha.get_all_values()
 
-                if len(dados_brutos) > 0:
-                    cabecalho = dados_brutos[0]
-                    linhas = dados_brutos[1:]
-                    df = pd.DataFrame(linhas, columns=cabecalho)
-
-                    st.write("### 📋 Painel de Controle: Dados Atuais da Turma")
-                    nome_coluna = "Conceito"
-
-                    if nome_coluna in df.columns:
-                        aba_todos, aba_excelente, aba_bom, aba_regular, aba_baixo = st.tabs(
-                            ["Todos os Alunos", "Excelente 🌟", "Bom 🟢", "Regular 🟡", "Baixo 🔴"]
-                        )
-                        with aba_todos:
-                            st.dataframe(df)
-                        with aba_excelente:
-                            st.dataframe(df[df[nome_coluna] == "Excelente"])
-                        with aba_bom:
-                            st.dataframe(df[df[nome_coluna] == "Bom"])
-                        with aba_regular:
-                            st.dataframe(df[df[nome_coluna] == "Regular"])
-                        with aba_baixo:
-                            st.dataframe(df[df[nome_coluna] == "Baixo"])
+                    if len(dados) <= 1:
+                        st.warning("A planilha ainda não tem respostas.")
                     else:
-                        st.dataframe(df)
-                else:
-                    st.warning("A planilha parece estar vazia ou sem cabeçalhos válidos.")
-            except Exception as e:
-                st.error(f"Não foi possível ler os dados: {str(e)}")
+                        st.session_state["df_turma"] = pd.DataFrame(
+                            dados[1:], columns=dados[0]
+                        )
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Não foi possível ler os dados: {e}")
+
+    if "df_turma" in st.session_state:
+        df = st.session_state["df_turma"]
+        st.divider()
+        st.write("### 📋 Painel da turma")
+
+        if "Conceito" in df.columns:
+            conceitos = ["Excelente", "Bom", "Regular", "Baixo"]
+            contagem = df["Conceito"].value_counts()
+
+            cols = st.columns(4)
+            for col, conceito in zip(cols, conceitos):
+                col.metric(conceito, int(contagem.get(conceito, 0)))
+
+            abas = st.tabs(["Todos", "Excelente 🌟", "Bom 🟢", "Regular 🟡", "Baixo 🔴"])
+            with abas[0]:
+                st.dataframe(df, use_container_width=True)
+            for aba, conceito in zip(abas[1:], conceitos):
+                with aba:
+                    st.dataframe(df[df["Conceito"] == conceito], use_container_width=True)
+        else:
+            st.dataframe(df, use_container_width=True)
+            st.caption("Processe as avaliações para ver o painel por conceito.")
