@@ -1,12 +1,10 @@
 """
 Sistema de Avaliação Inteligente — interface Streamlit.
-
 Fluxo:
   Aba 1 — material didático, folha de redação e geração da prova no Google Forms
   Aba 2 — correção multimodal de redações manuscritas (foto → transcrição → DUA)
   Aba 3 — processamento das notas na planilha e painel da turma
 """
-
 from __future__ import annotations
 
 import io
@@ -45,8 +43,7 @@ from gerador_forms import (
     extrair_id_planilha,
 )
 
-# set_page_config precisa ser a PRIMEIRA chamada Streamlit do script —
-# na versão anterior um st.toast() rodava antes e derrubava o app.
+# set_page_config precisa ser a PRIMEIRA chamada Streamlit do script
 st.set_page_config(
     page_title="Sistema de Avaliação Inteligente",
     page_icon="🎓",
@@ -70,12 +67,10 @@ ESCOPO_SHEETS = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-
 # ===========================================================================
 # PERSISTÊNCIA DO GABARITO
 # ===========================================================================
 def salvar_gabarito_em_disco(gabarito, tipo_gabarito: str) -> None:
-    """Guarda gabarito + tipo juntos, para o app se recuperar de um F5."""
     try:
         with open(ARQUIVO_GABARITO, "w", encoding="utf-8") as f:
             json.dump(
@@ -85,39 +80,30 @@ def salvar_gabarito_em_disco(gabarito, tipo_gabarito: str) -> None:
     except OSError as e:
         logger.warning("Não foi possível salvar o gabarito em disco: %s", e)
 
-
 def carregar_gabarito_salvo() -> None:
-    """Restaura o último gabarito do disco, se a sessão ainda não tiver um."""
     if "gabarito" in st.session_state or not os.path.exists(ARQUIVO_GABARITO):
         return
-
     try:
         with open(ARQUIVO_GABARITO, "r", encoding="utf-8") as f:
             conteudo = f.read().strip()
         if not conteudo:
             return
-
         dados = json.loads(conteudo)
-
         if isinstance(dados, dict) and "questoes" in dados:
             questoes = dados["questoes"]
             tipo = dados.get("tipo", "diagnostico")
         else:
-            # formato antigo: lista pura ou dicionário de níveis
             questoes = dados
             tipo = (
                 "adaptativo"
                 if isinstance(dados, dict) and any(n in dados for n in NIVEIS_ADAPTATIVOS)
                 else "diagnostico"
             )
-
         st.session_state["gabarito"] = questoes
         st.session_state["tipo_gabarito"] = tipo
         st.session_state["gabarito_restaurado"] = True
-
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("Gabarito salvo ilegível (%s) — ignorando.", e)
-
 
 # ===========================================================================
 # FOLHA DE REDAÇÃO EM PDF
@@ -134,7 +120,6 @@ class FolhaProducao(FPDF):
         self.set_text_color(130, 130, 130)
         self.cell(0, 10, f"Página {self.page_no()}", align="C")
 
-
 @st.cache_data(show_spinner=False)
 def criar_pdf_redacao(
     disciplina: str,
@@ -142,12 +127,6 @@ def criar_pdf_redacao(
     genero: str,
     linhas: int = 20,
 ) -> bytes:
-    """
-    Devolve o PDF em bytes.
-
-    A versão anterior usava tempfile.mktemp(), que é inseguro e deixa lixo no
-    disco do servidor a cada clique. Trabalhar em memória resolve os dois.
-    """
     pdf = FolhaProducao()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
@@ -182,19 +161,15 @@ def criar_pdf_redacao(
     saida = pdf.output()
     return bytes(saida)
 
-
 # ===========================================================================
 # LEITURA DO MATERIAL DIDÁTICO
 # ===========================================================================
 @st.cache_data(show_spinner=False)
 def _extrair_texto_pdf(conteudo: bytes) -> str:
-    """Cacheado pelo conteúdo do arquivo: não relê o PDF a cada rerun."""
     leitor = PdfReader(io.BytesIO(conteudo))
     return "\n".join((pagina.extract_text() or "") for pagina in leitor.pages)
 
-
 def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
-    """Separa PDFs (texto) e imagens (multimodal). Devolve (pacote, aviso)."""
     pacote: list = []
     texto_total = ""
     avisos: list[str] = []
@@ -212,14 +187,13 @@ def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
                     )
             else:
                 pacote.append(Image.open(arquivo))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             avisos.append(f"Não foi possível ler '{arquivo.name}': {e}")
 
     if texto_total.strip():
         pacote.append(texto_total)
 
     return pacote, " ".join(avisos)
-
 
 # ===========================================================================
 # PROMPTS
@@ -278,7 +252,6 @@ REGRAS DE ESTRUTURAÇÃO (para cada prova gerada):
 {instrucao_saida}
 """.strip()
 
-
 def montar_prompt_redacao(tema: str, genero: str) -> str:
     return f"""
 Atue como um professor avaliador rigoroso e empático da área de linguagens.
@@ -310,26 +283,20 @@ Universal para a Aprendizagem, com 1 ou 2 intervenções práticas para superar 
 barreiras de escrita identificadas.
 """.strip()
 
-
 def separar_nome_detectado(resposta: str) -> tuple[str, str]:
-    """Extrai a linha NOME_DETECTADO e devolve (nome, texto_restante)."""
     m = re.search(r"^\s*NOME_DETECTADO:\s*(.+)$", resposta, re.MULTILINE)
     if not m:
         return "Aluno não identificado", resposta
-
     nome = m.group(1).strip()
     if nome.upper() in ("DESCONHECIDO", "N/A", ""):
         nome = "Aluno não identificado"
-
     return nome, resposta[: m.start()] + resposta[m.end():]
-
 
 # ===========================================================================
 # GOOGLE SHEETS
 # ===========================================================================
 @st.cache_resource(show_spinner=False)
 def _cliente_sheets():
-    """Autoriza uma vez por sessão do servidor, em vez de a cada clique."""
     if "gcp_service_account" in st.secrets:
         info = dict(st.secrets["gcp_service_account"])
         credenciais = ServiceAccountCredentials.from_service_account_info(
@@ -345,9 +312,7 @@ def _cliente_sheets():
         credenciais = ServiceAccountCredentials.from_service_account_file(
             caminho, scopes=ESCOPO_SHEETS
         )
-
     return gspread.authorize(credenciais)
-
 
 def conectar_sheets(id_planilha: str):
     try:
@@ -357,7 +322,6 @@ def conectar_sheets(id_planilha: str):
             "Não foi possível abrir a planilha. Confira o link e verifique se ela "
             "foi compartilhada com o e-mail da conta de serviço (permissão de Editor)."
         ) from e
-
 
 # ===========================================================================
 # INTERFACE
@@ -412,8 +376,6 @@ with aba_prova:
     with col_linhas:
         num_linhas = st.number_input("Linhas:", min_value=10, max_value=30, value=20)
 
-    # O PDF é gerado direto no download_button: sem clique duplo e sem
-    # arquivo temporário sobrando no servidor.
     st.download_button(
         "📥 Baixar folha de redação (PDF)",
         data=criar_pdf_redacao(
@@ -455,8 +417,6 @@ with aba_prova:
         + (" para cada um dos 4 níveis." if adaptativa else ".")
     )
 
-    # Um único botão de geração — antes havia três widgets duplicados,
-    # o que provoca erro de ID repetido no Streamlit.
     if st.button(f"Gerar prova de {disciplina_escolhida}", type="primary"):
         if not materiais:
             st.warning("Envie ao menos um material didático antes de gerar a prova.")
@@ -479,20 +439,24 @@ with aba_prova:
                 resposta = gerar_com_retry(
                     client, NOME_MODELO_GEMINI, [prompt] + conteudo_para_ia
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 st.error(f"Falha ao chamar a IA: {e}")
                 st.stop()
 
         try:
-            questoes_json = carregar_json_ia(resposta.text)
-        except ValueError as e:
+            # Modo tolerante na conversão JSON para ignorar retornos de carro invisíveis
+            texto_sujo = resposta.text
+            match = re.search(r'(\{.*\}|\[.*\])', texto_sujo, re.DOTALL)
+            texto_limpo = match.group(0) if match else texto_sujo.replace("```json", "").replace("```", "").strip()
+            texto_limpo = texto_limpo.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').replace('\\n', ' ')
+            
+            questoes_json = json.loads(texto_limpo, strict=False)
+        except json.JSONDecodeError as e:
             st.error(f"A IA não devolveu o formato de dados esperado. {e}")
             with st.expander("Ver resposta bruta da IA"):
-                st.code(resposta.text, language="text")
+                st.code(texto_sujo, language="text")
             st.stop()
 
-        # Só depois de o JSON existir é que os formulários são criados —
-        # na versão anterior a criação vinha antes e quebrava com NameError.
         tipo_gabarito = "adaptativo" if adaptativa else "diagnostico"
         st.session_state["gabarito"] = questoes_json
         st.session_state["tipo_gabarito"] = tipo_gabarito
@@ -527,7 +491,7 @@ with aba_prova:
                     "Lembre-se de vincular o formulário a uma planilha de respostas "
                     "(Respostas → Vincular ao Sheets) e usar esse link na aba de notas."
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 st.error(f"O gabarito foi salvo, mas houve falha ao criar o formulário: {e}")
 
         with st.expander("Ver gabarito oficial (JSON)"):
@@ -559,25 +523,40 @@ with aba_redacao:
         else:
             with st.spinner("A IA está lendo a caligrafia e elaborando o diagnóstico..."):
                 try:
+                    # Prepara as imagens abrindo uma por uma da lista gerada pelo uploader
                     imagens = [Image.open(foto) for foto in fotos_redacao]
                     client = configurar_gemini()
+                    
+                    # Junta o prompt e as imagens em uma única lista e aciona a IA com retry
                     resposta = gerar_com_retry(
                         client,
                         NOME_MODELO_GEMINI,
                         [montar_prompt_redacao(tema_alvo, genero_alvo)] + imagens,
                     )
 
+                    # Separa o nome detectado no cabeçalho do restante do diagnóstico
                     nome_aluno, texto = separar_nome_detectado(resposta.text)
+                    
+                    # Salva os dados na memória do Streamlit para o botão de salvar no Docs funcionar
                     st.session_state["diagnostico_atual"] = texto.strip()
                     st.session_state["nome_aluno_redacao"] = nome_aluno
+                    
                     st.success("Análise concluída.")
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     st.error(f"Erro durante a leitura multimodal: {e}")
 
-    # Fica FORA do bloco do botão para o resultado sobreviver ao rerun —
-    # antes, o 'else' desse bloco exibia um aviso indevido o tempo todo.
     if "diagnostico_atual" in st.session_state:
         st.divider()
+
+        # --- PRÉ-VISUALIZAÇÃO MULTIMODAL ---
+        if fotos_redacao:
+            st.markdown("#### 🖼️ Imagem Original da Redação")
+            cols = st.columns(min(len(fotos_redacao), 3) if len(fotos_redacao) > 0 else 1)
+            for i, foto in enumerate(fotos_redacao):
+                cols[i % 3].image(foto, use_container_width=True)
+            st.divider()
+        # -----------------------------------
+
         nome_aluno = st.text_input(
             "Nome do aluno (detectado pela IA — corrija se necessário):",
             value=st.session_state.get("nome_aluno_redacao", ""),
@@ -598,7 +577,7 @@ with aba_redacao:
                         )
                         st.success("Relatório salvo no Drive.")
                         st.markdown(f"[🔗 Abrir o Google Docs]({link_doc})")
-                    except Exception as e:  # noqa: BLE001
+                    except Exception as e:
                         st.error(f"Não foi possível salvar: {e}")
 
         with col_limpar:
@@ -646,7 +625,7 @@ with aba_notas:
                         f"✅ {resumo['corrigidos']} aluno(s) corrigido(s) · "
                         f"{resumo['ignorados']} ignorado(s) · {resumo['erros']} com erro."
                     )
-                except Exception:  # noqa: BLE001
+                except Exception:
                     barra.empty()
                     st.error("Falha ao processar as avaliações.")
                     with st.expander("Detalhes técnicos"):
@@ -667,7 +646,7 @@ with aba_notas:
                         st.session_state["df_turma"] = pd.DataFrame(
                             dados[1:], columns=dados[0]
                         )
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     st.error(f"Não foi possível ler os dados: {e}")
 
     if "df_turma" in st.session_state:
