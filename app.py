@@ -20,6 +20,7 @@ from fpdf import FPDF
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from PIL import Image
 from pypdf import PdfReader
+from pptx import Presentation  # <--- Import necessário para ler slides
 
 from avaliador import (
     NOME_MODELO_GEMINI,
@@ -173,10 +174,11 @@ def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
     pacote: list = []
     texto_total = ""
     avisos: list[str] = []
-
     for arquivo in arquivos or []:
         try:
-            if arquivo.type == "application/pdf":
+            nome_minusculo = arquivo.name.lower()
+            
+            if nome_minusculo.endswith(".pdf"):
                 texto = _extrair_texto_pdf(arquivo.getvalue())
                 if texto.strip():
                     texto_total += texto + "\n"
@@ -185,14 +187,35 @@ def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
                         f"'{arquivo.name}' parece ser um PDF digitalizado sem texto. "
                         "Envie como imagem para a IA conseguir ler."
                     )
-            else:
+            
+            elif nome_minusculo.endswith(".pptx"):
+                # Leitura de arquivos PPTX (Textos e Imagens embutidas)
+                apresentacao = Presentation(arquivo)
+                for slide in apresentacao.slides:
+                    for shape in slide.shapes:
+                        # 1. Tenta ler os textos nas caixas nativas (se existirem)
+                        if shape.has_text_frame:
+                            for paragraph in shape.text_frame.paragraphs:
+                                texto_extraido_total += paragraph.text + "\n"
+                        
+                        # 2. NOVA REGRA: Extrai as imagens fixadas no slide
+                        if hasattr(shape, "image"):
+                            bytes_imagem = shape.image.blob
+                            imagem_extraida = Image.open(io.BytesIO(bytes_imagem))
+                            conteudo_para_ia.append(imagem_extraida)
+                            
+                st.success(f"✅ Apresentação PPTX '{arquivo.name}' lida com sucesso (textos e imagens extraídos)!")
+            elif nome_minusculo.endswith((".png", ".jpg", ".jpeg")):
                 pacote.append(Image.open(arquivo))
+                
+            else:
+                avisos.append(f"O formato do arquivo '{arquivo.name}' não é suportado.")
+                
         except Exception as e:
             avisos.append(f"Não foi possível ler '{arquivo.name}': {e}")
-
+            
     if texto_total.strip():
         pacote.append(texto_total)
-
     return pacote, " ".join(avisos)
 
 # ===========================================================================
@@ -387,13 +410,56 @@ with aba_prova:
 
     st.divider()
     st.subheader("📚 Material didático")
+    # No seu file_uploader, inclua "pptx":
     materiais = st.file_uploader(
-        "Envie PDFs ou imagens do conteúdo que servirá de base para a prova",
-        type=["pdf", "png", "jpg", "jpeg"],
+        "Escolha seus materiais (PDF, PPTX, PNG, JPG)",
+        type=["pdf", "pptx", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
         key="uploader_materiais",
     )
 
+    if materiais:
+        try:
+            conteudo_para_ia = []
+            texto_extraido_total = ""
+            for arquivo in materiais:
+                # Converte o nome para minúsculo para garantir a leitura correta da extensão
+                nome_minusculo = arquivo.name.lower()
+           
+                if nome_minusculo.endswith(".pdf"):
+                    leitor_pdf = PdfReader(arquivo)
+                    for pagina in leitor_pdf.pages:
+                        texto_pagina = pagina.extract_text()
+                        if texto_pagina:
+                            texto_extraido_total += texto_pagina + "\n"
+                    st.success(f"✅ Arquivo PDF '{arquivo.name}' lido com sucesso!")
+               
+                elif nome_minusculo.endswith(".pptx"):
+                    # Leitura de arquivos PPTX verificada pela extensão real do arquivo
+                    apresentacao = Presentation(arquivo)
+                    for slide in apresentacao.slides:
+                        for shape in slide.shapes:
+                            if shape.has_text_frame:
+                                for paragraph in shape.text_frame.paragraphs:
+                                    texto_extraido_total += paragraph.text + "\n"
+                    st.success(f"✅ Apresentação PPTX '{arquivo.name}' lida com sucesso!")
+               
+                elif nome_minusculo.endswith((".png", ".jpg", ".jpeg")):
+                    imagem = Image.open(arquivo)
+                    conteudo_para_ia.append(imagem)
+                    st.success(f"✅ Imagem '{arquivo.name}' carregada com sucesso!")
+                    st.image(imagem, caption=f"Lido: {arquivo.name}", use_container_width=True)
+               
+                else:
+                    st.warning(f"⚠️ O formato do arquivo '{arquivo.name}' não é suportado para leitura direta.")
+                    
+            if texto_extraido_total:
+                conteudo_para_ia.append(texto_extraido_total)
+                with st.expander("🔍 Clique para ver uma prévia de todo o texto extraído"):
+                    st.text(texto_extraido_total[:1000] + ("..." if len(texto_extraido_total) > 1000 else ""))
+                    
+        except Exception as e:
+            st.error(f"Erro durante o processamento do arquivo: {str(e)}")
     st.divider()
     st.subheader("🧠 Gerar avaliação no Google Forms")
 
