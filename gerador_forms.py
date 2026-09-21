@@ -29,10 +29,11 @@ SCOPES = [
 
 CAMPOS_IDENTIFICACAO = [
     "1. Nome Completo:",
-    "2. Turma:",
-    "3. Escola:",
-    "4. Nível de Ensino:",
-    "5. Componente Curricular:",
+    "2. E-mail",
+    "3. Turma:",
+    "4. Escola:",
+    "5. Nível de Ensino:",
+    "6. Componente Curricular:",
 ]
 
 LETRAS_ALTERNATIVAS = ["A", "B", "C", "D", "E"]

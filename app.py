@@ -177,7 +177,7 @@ def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
     for arquivo in arquivos or []:
         try:
             nome_minusculo = arquivo.name.lower()
-            
+
             if nome_minusculo.endswith(".pdf"):
                 texto = _extrair_texto_pdf(arquivo.getvalue())
                 if texto.strip():
@@ -187,7 +187,7 @@ def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
                         f"'{arquivo.name}' parece ser um PDF digitalizado sem texto. "
                         "Envie como imagem para a IA conseguir ler."
                     )
-            
+
             elif nome_minusculo.endswith(".pptx"):
                 # Leitura de arquivos PPTX (Textos e Imagens embutidas)
                 apresentacao = Presentation(arquivo)
@@ -197,23 +197,23 @@ def preparar_conteudo_para_ia(arquivos) -> tuple[list, str]:
                         if shape.has_text_frame:
                             for paragraph in shape.text_frame.paragraphs:
                                 texto_extraido_total += paragraph.text + "\n"
-                        
+
                         # 2. NOVA REGRA: Extrai as imagens fixadas no slide
                         if hasattr(shape, "image"):
                             bytes_imagem = shape.image.blob
                             imagem_extraida = Image.open(io.BytesIO(bytes_imagem))
                             conteudo_para_ia.append(imagem_extraida)
-                            
+
                 st.success(f"✅ Apresentação PPTX '{arquivo.name}' lida com sucesso (textos e imagens extraídos)!")
             elif nome_minusculo.endswith((".png", ".jpg", ".jpeg")):
                 pacote.append(Image.open(arquivo))
-                
+
             else:
                 avisos.append(f"O formato do arquivo '{arquivo.name}' não é suportado.")
-                
+
         except Exception as e:
             avisos.append(f"Não foi possível ler '{arquivo.name}': {e}")
-            
+
     if texto_total.strip():
         pacote.append(texto_total)
     return pacote, " ".join(avisos)
@@ -425,7 +425,7 @@ with aba_prova:
             for arquivo in materiais:
                 # Converte o nome para minúsculo para garantir a leitura correta da extensão
                 nome_minusculo = arquivo.name.lower()
-           
+
                 if nome_minusculo.endswith(".pdf"):
                     leitor_pdf = PdfReader(arquivo)
                     for pagina in leitor_pdf.pages:
@@ -433,7 +433,7 @@ with aba_prova:
                         if texto_pagina:
                             texto_extraido_total += texto_pagina + "\n"
                     st.success(f"✅ Arquivo PDF '{arquivo.name}' lido com sucesso!")
-               
+
                 elif nome_minusculo.endswith(".pptx"):
                     # Leitura de arquivos PPTX verificada pela extensão real do arquivo
                     apresentacao = Presentation(arquivo)
@@ -443,21 +443,21 @@ with aba_prova:
                                 for paragraph in shape.text_frame.paragraphs:
                                     texto_extraido_total += paragraph.text + "\n"
                     st.success(f"✅ Apresentação PPTX '{arquivo.name}' lida com sucesso!")
-               
+
                 elif nome_minusculo.endswith((".png", ".jpg", ".jpeg")):
                     imagem = Image.open(arquivo)
                     conteudo_para_ia.append(imagem)
                     st.success(f"✅ Imagem '{arquivo.name}' carregada com sucesso!")
                     st.image(imagem, caption=f"Lido: {arquivo.name}", use_container_width=True)
-               
+
                 else:
                     st.warning(f"⚠️ O formato do arquivo '{arquivo.name}' não é suportado para leitura direta.")
-                    
+
             if texto_extraido_total:
                 conteudo_para_ia.append(texto_extraido_total)
                 with st.expander("🔍 Clique para ver uma prévia de todo o texto extraído"):
                     st.text(texto_extraido_total[:1000] + ("..." if len(texto_extraido_total) > 1000 else ""))
-                    
+
         except Exception as e:
             st.error(f"Erro durante o processamento do arquivo: {str(e)}")
     st.divider()
@@ -515,7 +515,7 @@ with aba_prova:
             match = re.search(r'(\{.*\}|\[.*\])', texto_sujo, re.DOTALL)
             texto_limpo = match.group(0) if match else texto_sujo.replace("```json", "").replace("```", "").strip()
             texto_limpo = texto_limpo.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ').replace('\\n', ' ')
-            
+
             questoes_json = json.loads(texto_limpo, strict=False)
         except json.JSONDecodeError as e:
             st.error(f"A IA não devolveu o formato de dados esperado. {e}")
@@ -536,12 +536,23 @@ with aba_prova:
                         st.stop()
 
                     st.write("### 🔗 Avaliações adaptativas geradas")
-                    for nivel, lista in questoes_json.items():
-                        link = criar_formulario_ia(
-                            lista, f"{disciplina_escolhida} (Nível {nivel})", id_pasta_provas
-                        )
-                        st.markdown(f"- **Grupo {nivel}:** [Abrir Google Forms]({link})")
-                    st.success("Os 4 formulários adaptativos foram criados.")
+
+                    # --- NOVA LINHA: Criar a memória dos links ---
+                    st.session_state["links_adaptativos"] = {} 
+
+                    for nivel, lista_questoes in questoes_json.items():
+                        texto_nivel = json.dumps(lista_questoes, ensure_ascii=False)
+                        nome_prova_nivel = f"{disciplina_escolhida} (Nível {nivel})"
+                        # Assume id_pasta_provas is needed based on previous code
+                        link_nivel = criar_formulario_ia(texto_nivel, nome_prova_nivel, id_pasta_provas)
+
+                        # --- NOVA LINHA: Guardar o link na memória ---
+                        st.session_state["links_adaptativos"][nivel] = link_nivel 
+
+                        st.markdown(f"- **Grupo {nivel}:** [Acessar Google Forms]({link_nivel})")
+
+                    st.success("🎉 Os 4 formulários adaptativos foram gerados com sucesso!")
+
                 else:
                     if not isinstance(questoes_json, list):
                         st.error("A IA devolveu um dicionário, mas o modo diagnóstico exige uma lista.")
@@ -553,15 +564,15 @@ with aba_prova:
                     st.success("Avaliação e formulário criados.")
                     st.markdown(f"### 🔗 [Abrir o Google Forms]({link})")
 
-                st.caption(
-                    "Lembre-se de vincular o formulário a uma planilha de respostas "
-                    "(Respostas → Vincular ao Sheets) e usar esse link na aba de notas."
-                )
+                    st.caption(
+                        "Lembre-se de vincular o formulário a uma planilha de respostas "
+                        "(Respostas → Vincular ao Sheets) e usar esse link na aba de notas."
+                    )
             except Exception as e:
                 st.error(f"O gabarito foi salvo, mas houve falha ao criar o formulário: {e}")
 
-        with st.expander("Ver gabarito oficial (JSON)"):
-            st.code(json.dumps(questoes_json, ensure_ascii=False, indent=2), language="json")
+            with st.expander("Ver gabarito oficial (JSON)"):
+                st.code(json.dumps(questoes_json, ensure_ascii=False, indent=2), language="json")
 
 # ---------------------------------------------------------------------------
 # ABA 2 — correção multimodal de redações
@@ -592,7 +603,7 @@ with aba_redacao:
                     # Prepara as imagens abrindo uma por uma da lista gerada pelo uploader
                     imagens = [Image.open(foto) for foto in fotos_redacao]
                     client = configurar_gemini()
-                    
+
                     # Junta o prompt e as imagens em uma única lista e aciona a IA com retry
                     resposta = gerar_com_retry(
                         client,
@@ -602,11 +613,11 @@ with aba_redacao:
 
                     # Separa o nome detectado no cabeçalho do restante do diagnóstico
                     nome_aluno, texto = separar_nome_detectado(resposta.text)
-                    
+
                     # Salva os dados na memória do Streamlit para o botão de salvar no Docs funcionar
                     st.session_state["diagnostico_atual"] = texto.strip()
                     st.session_state["nome_aluno_redacao"] = nome_aluno
-                    
+
                     st.success("Análise concluída.")
                 except Exception as e:
                     st.error(f"Erro durante a leitura multimodal: {e}")
@@ -737,3 +748,47 @@ with aba_notas:
         else:
             st.dataframe(df, use_container_width=True)
             st.caption("Processe as avaliações para ver o painel por conceito.")
+
+            # --- INÍCIO DO MÓDULO DE DISPARO DE E-MAILS ---
+        st.divider()
+        st.write("### 📧 Envio de Avaliação Adaptativa")
+        st.info("Abaixo, você pode enviar o link da prova adaptativa para o e-mail do aluno. Caso tenha percebido uma melhora, você tem total liberdade para escolher um nível superior ao sugerido pelo diagnóstico.")
+
+        # O sistema procura dinamicamente qual coluna contém o e-mail e o nome do aluno
+        col_email = next((col for col in df.columns if "mail" in col.lower()), None)
+        col_nome = df.columns[1] if len(df.columns) > 1 else None
+
+        if not col_email:
+            st.warning("⚠️ Não foi encontrada uma coluna de E-mail na planilha. Lembre-se de ativar 'Coletar e-mails' nas configurações do seu Google Forms da Avaliação Diagnóstica.")
+        elif "links_adaptativos" not in st.session_state:
+            st.warning("⚠️ Os links adaptativos não estão na memória. Gere a prova Adaptativa no Passo 2 primeiro.")
+        else:
+            col_A, col_B, col_C = st.columns([2, 1, 1])
+
+            with col_A:
+                # O professor seleciona o aluno vendo o diagnóstico sugerido pela IA
+                lista_alunos = df.apply(lambda row: f"{row[col_nome]} (Diagnóstico Sugerido: {row.get('Conceito', 'N/A')})", axis=1).tolist()
+                aluno_selecionado = st.selectbox("🧑‍🎓 Selecione o Aluno:", lista_alunos)
+
+            with col_B:
+                # O professor escolhe livremente qual nível enviar
+                nivel_escolhido = st.selectbox("📈 Escolha o Nível para enviar:", ["Baixo", "Regular", "Bom", "Excelente"])
+
+            with col_C:
+                st.write("") # Espaçamento para alinhar o botão
+                st.write("")
+
+                idx = lista_alunos.index(aluno_selecionado)
+                email_do_aluno = df.iloc[idx][col_email]
+                link_da_prova = st.session_state["links_adaptativos"].get(nivel_escolhido, "")
+
+                if link_da_prova and str(email_do_aluno).strip() != "":
+                    import urllib.parse
+                    assunto = urllib.parse.quote("Sua Nova Avaliação Adaptativa")
+                    corpo = urllib.parse.quote(f"Olá!\n\nO professor preparou uma nova avaliação adaptativa para você continuar evoluindo.\n\nClique no link abaixo para começar:\n{link_da_prova}\n\nBom trabalho!")
+                    link_mailto = f"mailto:{email_do_aluno}?subject={assunto}&body={corpo}"
+
+                    st.markdown(f'<a href="{link_mailto}" target="_blank"><button style="width:100%; padding:9px; background-color:#4CAF50; color:white; border:none; border-radius:5px; cursor:pointer;">✉️ Enviar E-mail</button></a>', unsafe_allow_html=True)
+                else:
+                    st.error("E-mail não cadastrado.")
+        # --- FIM DO MÓDULO DE DISPARO DE E-MAILS ---
