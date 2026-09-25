@@ -35,7 +35,7 @@ def obter_config(chave: str, padrao: str | None = None) -> str | None:
 NOME_MODELO_GEMINI = obter_config("GEMINI_MODEL", "gemini-3.6-flash")
 MODELOS_FALLBACK = [
     NOME_MODELO_GEMINI,
-    "gemini-3.6-flash",
+    "gemini-2.5-flash",
 ]
 
 # --------------------------------------------------------------------------

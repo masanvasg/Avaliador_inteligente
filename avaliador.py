@@ -60,7 +60,7 @@ def gerar_com_retry(client, model: str, contents: Any, max_tentativas: int = 3):
 
     Regras:
       - 503 / erro de servidor  → espera e tenta de novo no MESMO modelo;
-      - 429 (cota estourada)    → troca de modelo na hora (cota é por modelo);
+      - 429 (cota estourada)    → AGORA espera e tenta de novo;
       - demais erros de cliente → propaga imediatamente (ex.: chave inválida).
     """
     modelos = list(dict.fromkeys([model, *MODELOS_FALLBACK]))
@@ -87,11 +87,13 @@ def gerar_com_retry(client, model: str, contents: Any, max_tentativas: int = 3):
                 codigo = getattr(e, "code", None)
 
                 if codigo == 429:
+                    espera = (tentativa + 1) * 5 # Aguarda 5s, 10s, 15s...
                     logger.warning(
-                        "Cota esgotada para %s (429). Passando para o próximo modelo.",
-                        modelo_atual,
+                        "Cota esgotada para %s (429). Tentativa %d/%d — aguardando %ds.",
+                        modelo_atual, tentativa + 1, max_tentativas, espera,
                     )
-                    break
+                    time.sleep(espera)
+                    continue  # <-- Substituímos o 'break' para ele não desistir do modelo
 
                 if codigo == 503:
                     espera = 2**tentativa
@@ -110,7 +112,6 @@ def gerar_com_retry(client, model: str, contents: Any, max_tentativas: int = 3):
         "A API do Gemini não respondeu após várias tentativas em todos os modelos "
         "de fallback. Tente novamente em alguns minutos."
     ) from ultimo_erro
-
 
 # ---------------------------------------------------------------------------
 # Extração de JSON
