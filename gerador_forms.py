@@ -4,9 +4,8 @@ Integração com Google Forms, Drive e Docs.
   - autenticação OAuth (local ou via Secrets no Streamlit Cloud);
   - criação do formulário com cabeçalho de identificação + questões;
   - movimentação do arquivo para a pasta da turma;
-  - geração do relatório de diagnóstico em Google Docs.
+  - geração do relatório de diagnóstico em Google Docs (com títulos formatados).
 """
-
 from __future__ import annotations
 
 import json
@@ -89,6 +88,17 @@ def _validar_json_caminho(caminho: str, nome_amigavel: str) -> dict:
         ) from e
 
 
+def _renovar_se_preciso(creds: Credentials) -> Credentials | None:
+    """Renova o token vencido; devolve None se não for possível."""
+    try:
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        return creds if creds.valid else None
+    except Exception as e:  # noqa: BLE001 — token revogado/expirado → refazer login
+        logger.warning("Não foi possível renovar o token OAuth: %s", e)
+        return None
+
+
 def _credenciais_dos_secrets() -> Credentials | None:
     try:
         import streamlit as st
@@ -96,13 +106,14 @@ def _credenciais_dos_secrets() -> Credentials | None:
         if "google_token" not in st.secrets:
             return None
         info = dict(st.secrets["google_token"])
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
-    creds = Credentials.from_authorized_user_info(info, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return creds if creds.valid else None
+    try:
+        return _renovar_se_preciso(Credentials.from_authorized_user_info(info, SCOPES))
+    except (ValueError, KeyError) as e:
+        logger.warning("Bloco [google_token] dos Secrets inválido: %s", e)
+        return None
 
 
 def _credenciais_do_token() -> Credentials | None:
@@ -110,12 +121,18 @@ def _credenciais_do_token() -> Credentials | None:
         return None
     try:
         creds = Credentials.from_authorized_user_file(CAMINHO_TOKEN, SCOPES)
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        return creds if creds.valid else None
-    except Exception:
-        logger.warning("token.json inválido ou expirado — será refeito o login.")
+    except Exception:  # noqa: BLE001
+        logger.warning("token.json inválido — será refeito o login.")
         return None
+
+    renovado = _renovar_se_preciso(creds)
+    if renovado and renovado is creds:
+        try:  # guarda o token renovado para as próximas execuções
+            with open(CAMINHO_TOKEN, "w", encoding="utf-8") as f:
+                f.write(renovado.to_json())
+        except OSError:
+            pass
+    return renovado
 
 
 def autenticar_usuario() -> Credentials:
@@ -191,6 +208,8 @@ def _item_multipla_escolha(titulo: str, index: int, questao: dict) -> dict:
         for letra in LETRAS_ALTERNATIVAS
         if questao.get(letra)
     ]
+    if len(opcoes) < 2:
+        raise ValueError(f"A questão '{titulo[:40]}...' tem menos de 2 alternativas.")
     return {
         "createItem": {
             "item": {
@@ -215,7 +234,7 @@ def montar_requests_forms(questoes: list[dict]) -> list[dict]:
 
     for i, q in enumerate(questoes):
         index = i + len(CAMPOS_IDENTIFICACAO)
-        titulo = f"Questão {i + 1}: {q.get('pergunta', '').strip()}"
+        titulo = f"Questão {i + 1}: {str(q.get('pergunta', '')).strip()}"
 
         if q.get("tipo") == "discursiva":
             requests.append(_item_texto(titulo, index, paragrafo=True))
@@ -260,6 +279,10 @@ def criar_formulario_ia(
     if not isinstance(questoes, list) or not questoes:
         raise ValueError("A lista de questões está vazia ou em formato inesperado.")
 
+    # Monta os requests ANTES de criar o formulário: se houver questão inválida,
+    # falha sem deixar um formulário vazio "órfão" no Drive.
+    requests = montar_requests_forms(questoes)
+
     creds = autenticar_usuario()
     servicos = _servicos(creds)
 
@@ -271,11 +294,10 @@ def criar_formulario_ia(
             }
         }
     ).execute()
-
     form_id = form["formId"]
 
     servicos["forms"].forms().batchUpdate(
-        formId=form_id, body={"requests": montar_requests_forms(questoes)}
+        formId=form_id, body={"requests": requests}
     ).execute()
 
     _mover_para_pasta(servicos["drive"], form_id, id_pasta_destino)
@@ -287,6 +309,73 @@ def criar_formulario_ia(
 # ---------------------------------------------------------------------------
 # Relatório em Google Docs
 # ---------------------------------------------------------------------------
+def _utf16_len(texto: str) -> int:
+    """O Google Docs indexa em unidades UTF-16 (emoji conta 2)."""
+    return len(texto.encode("utf-16-le")) // 2
+
+
+def _markdown_para_docs(titulo: str, markdown: str) -> tuple[str, list[dict]]:
+    """
+    Converte o Markdown simples da IA em texto + requests de estilo do Docs:
+    '#', '##', '###' viram títulos; '**negrito**' vira negrito; '- ' vira marcador textual.
+    """
+    texto = ""
+    estilos: list[dict] = []
+
+    def adicionar(linha: str, estilo: str | None = None) -> None:
+        nonlocal texto
+        inicio = 1 + _utf16_len(texto)
+        texto += linha + "\n"
+        if estilo:
+            estilos.append(
+                {
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": inicio, "endIndex": inicio + _utf16_len(linha) + 1},
+                        "paragraphStyle": {"namedStyleType": estilo},
+                        "fields": "namedStyleType",
+                    }
+                }
+            )
+
+    adicionar(titulo, "TITLE")
+
+    for bruta in markdown.splitlines():
+        linha = bruta.rstrip()
+        m = re.match(r"^(#{1,6})\s+(.*)$", linha)
+        if m:
+            nivel = min(len(m.group(1)), 3)
+            adicionar(re.sub(r"[*_`]", "", m.group(2)), f"HEADING_{nivel}")
+            continue
+
+        linha = re.sub(r"^\s*[-*]\s+", "• ", linha)
+
+        # Negrito: registra os trechos entre ** ** e remove os marcadores
+        partes = re.split(r"(\*\*[^*]+\*\*)", linha)
+        limpa = ""
+        trechos_negrito: list[tuple[int, int]] = []
+        for parte in partes:
+            if parte.startswith("**") and parte.endswith("**") and len(parte) > 4:
+                miolo = parte[2:-2]
+                trechos_negrito.append((_utf16_len(limpa), _utf16_len(limpa) + _utf16_len(miolo)))
+                limpa += miolo
+            else:
+                limpa += parte
+        base = 1 + _utf16_len(texto)
+        adicionar(limpa)
+        for ini, fim in trechos_negrito:
+            estilos.append(
+                {
+                    "updateTextStyle": {
+                        "range": {"startIndex": base + ini, "endIndex": base + fim},
+                        "textStyle": {"bold": True},
+                        "fields": "bold",
+                    }
+                }
+            )
+
+    return texto, estilos
+
+
 def criar_relatorio_google_docs(
     nome_aluno: str,
     texto_diagnostico: str,
@@ -309,11 +398,13 @@ def criar_relatorio_google_docs(
     arquivo = servicos["drive"].files().create(body=metadados, fields="id").execute()
     id_documento = arquivo["id"]
 
+    texto, estilos = _markdown_para_docs(f"Diagnóstico DUA — {nome_aluno}", texto_diagnostico)
     servicos["docs"].documents().batchUpdate(
         documentId=id_documento,
         body={
             "requests": [
-                {"insertText": {"location": {"index": 1}, "text": texto_diagnostico}}
+                {"insertText": {"location": {"index": 1}, "text": texto}},
+                *estilos,  # estilos vêm DEPOIS da inserção do texto
             ]
         },
     ).execute()
